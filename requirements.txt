@@ -1,0 +1,8 @@
+fastapi
+kiwipiepy
+openpyxl
+pandas
+pydantic
+python-pptx
+scikit-learn
+uvicorn

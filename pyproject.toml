@@ -1,0 +1,18 @@
+[project]
+name = "ai-survey-insight"
+version = "0.1.0"
+description = "Korean survey free-response topic modeling MVP"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "kiwipiepy",
+  "openpyxl",
+  "pandas",
+  "pydantic",
+  "python-pptx",
+  "scikit-learn",
+  "uvicorn",
+]
+
+[tool.setuptools.packages.find]
+include = ["survey_insight*"]
