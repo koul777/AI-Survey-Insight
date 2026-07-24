@@ -1,5 +1,9 @@
 # AI Survey Insight
 
+<p align="center">
+  <img src="docs/images/readme-cover.jpg" alt="AI Survey Insight 대표 프로젝트 소개 이미지" width="100%" />
+</p>
+
 AI Survey Insight는 한국어 설문 자유응답을 업로드하면 컬럼을 자동 점검하고, 토픽모델링과 감정분석을 실행한 뒤 Excel, Word, PowerPoint 보고서까지 생성하는 로컬 분석 도구입니다.
 
 비전공자도 결과를 바로 검토할 수 있도록 토픽 수 추천 이유, 우선 확인할 토픽, 감정 근거, 대표 의견, 다음 대응 방향을 쉬운 한국어로 정리합니다. OpenAI, Gemini, Claude, Azure OpenAI, OpenAI 호환 서버를 선택적으로 연결할 수 있으며, API 키는 분석 요청 중에만 사용하고 저장하지 않습니다.
