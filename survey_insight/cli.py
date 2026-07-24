@@ -10,7 +10,7 @@ from .pipeline import analyze_file, write_analysis_package
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AI Survey Insight MVP CLI")
+    parser = argparse.ArgumentParser(description="AI Survey Insight CLI")
     sub = parser.add_subparsers(dest="command")
     demo = sub.add_parser("demo", help="Create a PRD-like fixture and export reports")
     demo.add_argument("--out", default="out", help="Output directory")

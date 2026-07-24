@@ -1,4 +1,4 @@
-"""AI Survey Insight MVP package."""
+"""AI Survey Insight package."""
 
 from .pipeline import analyze_file, analyze_table
 
