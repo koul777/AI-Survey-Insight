@@ -7,7 +7,7 @@
 개발 환경을 설치한 뒤 다음을 실행합니다.
 
 ```powershell
-python -m pip install -e .
+python -m pip install -e ".[test]"
 python -m unittest discover -s tests -v
 python -m compileall survey_insight tests
 ```
@@ -24,7 +24,9 @@ python -m compileall survey_insight tests
 - LDA 성분 키워드와 0–1 문서–토픽 배정값
 - 허용 토픽 수 범위와 소표본 경고
 - 같은 입력·같은 seed의 로컬 결과 재현성
-- 선정 후보의 3회 층화 80% 부분표본 일치도와 낮은 일치도 경고
+- 512개 제한 범위 가중치 시나리오의 후보 선정률과 동일 seed 재현성
+- 선정 배정의 500회 assignment-conditional bootstrap 구조 관문 통과율·토픽 비율 구간
+- 선정 후보의 5회 층화 80% 부분표본 일치도와 낮은 일치도 경고
 - LDA 입력이 지나치게 짧을 때의 근거 부족 관문
 - 대표 응답과 보고서 파일 구조
 - Excel에 `original_text`가 없고 마스킹 텍스트만 포함되는지
@@ -56,9 +58,12 @@ python -m survey_insight.cli demo --out .\out_evaluation --seed 42
 2. 권장 토픽 수가 `recommendation.allowed_topic_range` 안에 있습니다.
 3. `recommendation.candidates`에 로컬 KMeans, NMF, LDA 후보가 생성됩니다. 데이터 구조에 따라 계층 군집·DBSCAN 후보 수는 달라질 수 있습니다.
 4. 권장 후보의 `params.feature_space`와 `params.metric_profile`로 입력 표현과 평가 버전을 추적할 수 있습니다.
-5. 각 토픽에 키워드와 최대 3개의 대표 응답이 생성됩니다.
-6. Excel, Word, PowerPoint 파일이 열 수 있는 OOXML 구조로 생성됩니다.
-7. 같은 환경에서 같은 입력과 `--seed 42`로 두 번 실행했을 때 권장 엔진, 토픽 수, 점수, 토픽별 키워드·건수가 같습니다. 실행 ID는 달라도 정상입니다.
+5. 권장 후보에 `metrics.weight_acceptability`, `metrics.bootstrap_gate_pass_rate`, `params.bootstrap_topic_share_intervals`가 있으며 모두 선언된 범위 안에 있습니다.
+6. 각 토픽에 키워드와 최대 3개의 대표 응답이 생성됩니다.
+7. Excel, Word, PowerPoint 파일이 열 수 있는 OOXML 구조로 생성됩니다.
+8. 같은 환경에서 같은 입력과 `--seed 42`로 두 번 실행했을 때 권장 엔진, 토픽 수, 점수, 가중치 선정률, bootstrap 결과, 토픽별 키워드·건수가 같습니다. 실행 ID는 달라도 정상입니다.
+
+이 점검에서 “통계적 검정력”을 통과 조건으로 두지 않습니다. 현재 파이프라인에는 검정할 귀무가설·효과크기·정답 토픽이 없기 때문입니다. 대신 가중치 선택 민감도와 재표본 변동성을 구조적 결과로 기록하며, 이를 정확도나 p-value로 해석하지 않습니다.
 
 검증 후 `out_evaluation/`은 실제 설문을 담을 수 있는 로컬 산출물이므로 Git에 추가하지 말고 필요 없으면 삭제합니다.
 

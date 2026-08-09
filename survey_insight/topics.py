@@ -29,6 +29,19 @@ from .preprocessing import tokenize_keywords, tokenizer_source, valid_documents
 from .sentiment import aggregate_topic_sentiment
 
 
+SCORE_WEIGHTS = {
+    "semantic_quality": 0.30,
+    "coherence": 0.25,
+    "coverage": 0.15,
+    "diversity": 0.10,
+    "labelability": 0.10,
+    "balance": 0.10,
+}
+WEIGHT_SENSITIVITY_SCENARIOS = 512
+WEIGHT_MULTIPLIER_RANGE = (0.50, 1.50)
+ASSIGNMENT_BOOTSTRAP_REPEATS = 500
+
+
 def recommend_topics(
     documents: list[TextDocument],
     seed: int = 42,
@@ -94,6 +107,7 @@ def recommend_topics(
         )
     if not candidates:
         candidates = [_single_topic_candidate(valid, vectorizer, matrix, min_topic_size)]
+    _attach_weight_sensitivity(candidates, seed)
     candidates.sort(
         key=lambda candidate: (
             candidate.params.get("quality_gate_passed") is True,
@@ -113,6 +127,7 @@ def recommend_topics(
         embedding_result.vectors if embedding_result is not None and embedding_result.vectors.size else None,
         seed,
     )
+    bootstrap_warning = _attach_assignment_bootstrap(recommended, valid, seed)
     wider = _select_alternative(candidates, recommended.topic_count, direction=-1)
     detailed = _select_alternative(candidates, recommended.topic_count, direction=1)
     selection_warnings = []
@@ -122,6 +137,12 @@ def recommend_topics(
         )
     if resampling_warning:
         selection_warnings.append(resampling_warning)
+    if bootstrap_warning:
+        selection_warnings.append(bootstrap_warning)
+    if recommended.metrics.get("weight_acceptability", 1.0) < 0.50:
+        selection_warnings.append(
+            "가중치 시나리오에 따라 다른 후보가 자주 선택되어 권장안의 가중치 민감도가 높습니다."
+        )
     recommendation = Recommendation(
         run_id=run_id,
         mode=mode,
@@ -549,15 +570,7 @@ def _candidate_from_labels(
         coherence_matrix=matrix,
     )
     penalty = _penalty(labels, topics, min_topic_size)
-    score = (
-        0.30 * metrics["semantic_quality"]
-        + 0.25 * metrics["coherence"]
-        + 0.15 * metrics["coverage"]
-        + 0.10 * metrics["diversity"]
-        + 0.10 * metrics["labelability"]
-        + 0.10 * metrics["balance"]
-        - penalty
-    )
+    score = _composite_score(metrics, penalty, SCORE_WEIGHTS)
     warnings = []
     if any(topic.count < min_topic_size for topic in topics):
         warnings.append("최소 토픽 크기보다 작은 토픽이 포함되어 있습니다.")
@@ -582,7 +595,7 @@ def _candidate_from_labels(
             "engine": source,
             "min_topic_size": min_topic_size,
             "tokenizer": tokenizer_source(),
-            "metric_profile": "heuristic_v2",
+            "metric_profile": "heuristic_v3_weight_sensitivity_bootstrap",
             "requested_topic_count": k,
             "quality_gate_passed": not quality_gate_reasons,
             "quality_gate_reasons": quality_gate_reasons,
@@ -889,13 +902,114 @@ def _topic_count_from_labels(labels: np.ndarray) -> int:
     return len({int(label) for label in labels if int(label) != -1})
 
 
+def _composite_score(
+    metrics: dict[str, float],
+    penalty: float,
+    weights: dict[str, float],
+) -> float:
+    weighted = sum(
+        float(weights.get(metric, 0.0)) * float(metrics.get(metric, 0.0))
+        for metric in SCORE_WEIGHTS
+    )
+    return max(0.0, min(1.0, weighted - float(penalty)))
+
+
+def _attach_weight_sensitivity(
+    candidates: list[CandidateSolution],
+    seed: int,
+    scenarios: int = WEIGHT_SENSITIVITY_SCENARIOS,
+    multiplier_range: tuple[float, float] = WEIGHT_MULTIPLIER_RANGE,
+) -> None:
+    """Attach an SMAA-inspired weight-sensitivity diagnostic.
+
+    The diagnostic does not learn or claim objective weights. It perturbs each
+    documented base weight inside a declared range, normalizes the weight
+    vector, and reports how often each structurally eligible candidate would be
+    selected under the existing near-best/parsimony rule.
+    """
+
+    if not candidates:
+        return
+    passed = [
+        candidate
+        for candidate in candidates
+        if candidate.params.get("quality_gate_passed") is True
+    ]
+    pool = passed or candidates
+    scenarios = max(1, int(scenarios))
+    low, high = multiplier_range
+    if low <= 0 or high < low:
+        raise ValueError("weight multiplier range must be positive and ordered")
+
+    metric_names = list(SCORE_WEIGHTS)
+    base = np.asarray([SCORE_WEIGHTS[name] for name in metric_names], dtype=float)
+    rng = np.random.default_rng(seed + 7919)
+    multipliers = rng.uniform(low, high, size=(scenarios, len(metric_names)))
+    sampled_weights = multipliers * base
+    sampled_weights /= sampled_weights.sum(axis=1, keepdims=True)
+    values = np.asarray(
+        [[float(candidate.metrics.get(name, 0.0)) for name in metric_names] for candidate in pool],
+        dtype=float,
+    )
+    penalties = np.asarray(
+        [float(candidate.metrics.get("penalty", 0.0)) for candidate in pool],
+        dtype=float,
+    )
+    scenario_scores = np.clip(values @ sampled_weights.T - penalties[:, None], 0.0, 1.0)
+    wins = np.zeros(len(pool), dtype=int)
+    for scenario_index in range(scenarios):
+        scores = scenario_scores[:, scenario_index]
+        best_score = float(scores.max())
+        threshold = max(0.03, best_score * 0.05)
+        near_best = [
+            index
+            for index, score in enumerate(scores)
+            if best_score - float(score) <= threshold
+        ]
+        winner = min(
+            near_best,
+            key=lambda index: (pool[index].topic_count, -float(scores[index]), index),
+        )
+        wins[winner] += 1
+
+    pool_indices = {id(candidate): index for index, candidate in enumerate(pool)}
+    for candidate in candidates:
+        candidate.params["base_score_weights"] = dict(SCORE_WEIGHTS)
+        candidate.params["weight_sensitivity_profile"] = "bounded_monte_carlo_v1"
+        candidate.params["weight_sensitivity_scenarios"] = scenarios
+        candidate.params["weight_multiplier_range"] = [float(low), float(high)]
+        pool_index = pool_indices.get(id(candidate))
+        if pool_index is None:
+            candidate.params["weight_sensitivity_status"] = "excluded_by_quality_gate"
+            candidate.metrics["weight_acceptability"] = 0.0
+            continue
+        candidate.params["weight_sensitivity_status"] = "evaluated"
+        acceptability = float(wins[pool_index] / scenarios)
+        candidate.metrics["weight_acceptability"] = round(acceptability, 3)
+        candidate.metrics["weight_acceptability_mcse"] = round(
+            math.sqrt(acceptability * (1.0 - acceptability) / scenarios), 4
+        )
+        candidate.metrics["weight_score_p10"] = round(
+            float(np.quantile(scenario_scores[pool_index], 0.10)), 3
+        )
+        candidate.metrics["weight_score_p90"] = round(
+            float(np.quantile(scenario_scores[pool_index], 0.90)), 3
+        )
+
+
 def _select_recommended(candidates: list[CandidateSolution]) -> CandidateSolution:
     passed = [candidate for candidate in candidates if candidate.params.get("quality_gate_passed") is True]
     pool = passed or candidates
     best_score = max(candidate.score for candidate in pool)
     threshold = max(0.03, best_score * 0.05)
     near_best = [candidate for candidate in pool if best_score - candidate.score <= threshold]
-    near_best.sort(key=lambda candidate: (candidate.topic_count, -candidate.score))
+    near_best.sort(
+        key=lambda candidate: (
+            -candidate.metrics.get("weight_acceptability", 0.0),
+            candidate.topic_count,
+            -candidate.score,
+        )
+    )
     return near_best[0]
 
 
@@ -919,7 +1033,7 @@ def _attach_resampling_diagnostic(
     count_matrix: Any,
     embedding_matrix: np.ndarray | None,
     seed: int,
-    repeats: int = 3,
+    repeats: int = 5,
     fraction: float = 0.80,
 ) -> str | None:
     """Attach a post-selection subsample agreement diagnostic.
@@ -966,10 +1080,101 @@ def _attach_resampling_diagnostic(
 
     stability = round(sum(scores) / len(scores), 3)
     candidate.metrics["resampling_stability"] = stability
+    candidate.metrics["resampling_stability_p10"] = round(float(np.quantile(scores, 0.10)), 3)
+    candidate.metrics["resampling_stability_p90"] = round(float(np.quantile(scores, 0.90)), 3)
+    candidate.params["resampling_scores"] = [round(score, 3) for score in scores]
     candidate.params["resampling_status"] = "evaluated"
     if stability < 0.60:
         candidate.warnings.append("부분표본 일치도가 0.60 미만입니다.")
         return f"부분표본 일치도가 {stability:.2f}로 낮아 토픽 수와 대표 응답을 재검토해야 합니다."
+    return None
+
+
+def _attach_assignment_bootstrap(
+    candidate: CandidateSolution,
+    documents: list[TextDocument],
+    seed: int,
+    repeats: int = ASSIGNMENT_BOOTSTRAP_REPEATS,
+) -> str | None:
+    """Estimate assignment-conditional structural uncertainty by bootstrap.
+
+    Documents are sampled with replacement while their selected assignments
+    stay fixed. This measures uncertainty in observed topic shares and quality
+    gate support conditional on this fitted solution. It does not refit the
+    model and is not a confidence interval for topic correctness.
+    """
+
+    repeats = max(1, int(repeats))
+    candidate.params["bootstrap_repeats"] = repeats
+    candidate.params["bootstrap_profile"] = "assignment_conditional_percentile_v1"
+    if not documents or candidate.topic_count <= 0:
+        candidate.params["bootstrap_status"] = "not_informative"
+        return None
+
+    labels = _labels_from_assignments(candidate, documents)
+    topic_labels = sorted(int(value) for value in set(labels) if int(value) != -1)
+    if not topic_labels:
+        candidate.params["bootstrap_status"] = "not_informative"
+        return None
+
+    min_topic_size = int(candidate.params.get("min_topic_size", 1))
+    rng = np.random.default_rng(seed + 15401)
+    coverage_values: list[float] = []
+    balance_values: list[float] = []
+    minimum_share_values: list[float] = []
+    topic_share_values = {label: [] for label in topic_labels}
+    gate_passes = 0
+    n = len(labels)
+    for _ in range(repeats):
+        sampled = labels[rng.integers(0, n, size=n)]
+        counts = [int(np.count_nonzero(sampled == label)) for label in topic_labels]
+        included = sum(counts)
+        coverage = included / n
+        coverage_values.append(coverage)
+        balance_values.append(_balance(counts) if included else 0.0)
+        minimum_share_values.append(min(counts) / n)
+        for label, count in zip(topic_labels, counts):
+            topic_share_values[label].append(count / n)
+        if coverage >= 0.70 and all(count >= min_topic_size for count in counts):
+            gate_passes += 1
+
+    intervals = []
+    topic_id_by_number = {
+        index: topic.topic_id for index, topic in enumerate(candidate.topics)
+    }
+    for label in topic_labels:
+        values = topic_share_values[label]
+        intervals.append(
+            {
+                "topic_id": topic_id_by_number.get(label, f"T{label + 1:02d}"),
+                "estimate": round(float(np.mean(labels == label)), 3),
+                "p025": round(float(np.quantile(values, 0.025)), 3),
+                "p975": round(float(np.quantile(values, 0.975)), 3),
+            }
+        )
+
+    gate_pass_rate = gate_passes / repeats
+    candidate.params["bootstrap_topic_share_intervals"] = intervals
+    candidate.params["bootstrap_status"] = "evaluated"
+    candidate.metrics["bootstrap_gate_pass_rate"] = round(float(gate_pass_rate), 3)
+    candidate.metrics["bootstrap_coverage_p025"] = round(
+        float(np.quantile(coverage_values, 0.025)), 3
+    )
+    candidate.metrics["bootstrap_coverage_p975"] = round(
+        float(np.quantile(coverage_values, 0.975)), 3
+    )
+    candidate.metrics["bootstrap_balance_p025"] = round(
+        float(np.quantile(balance_values, 0.025)), 3
+    )
+    candidate.metrics["bootstrap_min_topic_share_p025"] = round(
+        float(np.quantile(minimum_share_values, 0.025)), 3
+    )
+    if gate_pass_rate < 0.80:
+        candidate.warnings.append("Bootstrap 구조 관문 통과율이 0.80 미만입니다.")
+        return (
+            f"{repeats}회 assignment-conditional bootstrap의 구조 관문 통과율이 {gate_pass_rate:.0%}로 낮아 "
+            "토픽 비율과 작은 토픽을 재검토해야 합니다."
+        )
     return None
 
 

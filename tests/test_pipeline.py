@@ -17,7 +17,7 @@ from survey_insight.cli import create_demo_workbook
 from survey_insight.edits import apply_edit
 from survey_insight.embeddings import EmbeddingResult
 from survey_insight.exports import export_excel, export_powerpoint, export_word
-from survey_insight.models import Topic
+from survey_insight.models import CandidateSolution, TextDocument, Topic, TopicAssignment
 from survey_insight.pipeline import analyze_file
 from survey_insight.preprocessing import (
     detect_privacy_review_flags,
@@ -27,12 +27,15 @@ from survey_insight.preprocessing import (
     tokenizer_source,
 )
 from survey_insight.topics import (
+    _attach_assignment_bootstrap,
+    _attach_weight_sensitivity,
     _cluster,
     _coherence,
     _count_vectorize,
     _fit_nmf,
     _lda_input_diagnostics,
     _silhouette,
+    _select_recommended,
     topic_policy,
 )
 
@@ -83,6 +86,15 @@ class PipelineTests(unittest.TestCase):
             if resampling_status == "evaluated":
                 self.assertGreaterEqual(package.recommendation.recommended.metrics["resampling_stability"], 0.0)
                 self.assertLessEqual(package.recommendation.recommended.metrics["resampling_stability"], 1.0)
+                self.assertEqual(package.recommendation.recommended.params["resampling_repeats"], 5)
+            self.assertEqual(package.recommendation.recommended.params["weight_sensitivity_scenarios"], 512)
+            self.assertEqual(package.recommendation.recommended.params["bootstrap_repeats"], 500)
+            self.assertEqual(package.recommendation.recommended.params["bootstrap_status"], "evaluated")
+            self.assertGreaterEqual(package.recommendation.recommended.metrics["weight_acceptability"], 0.0)
+            self.assertLessEqual(package.recommendation.recommended.metrics["weight_acceptability"], 1.0)
+            self.assertGreaterEqual(package.recommendation.recommended.metrics["bootstrap_gate_pass_rate"], 0.0)
+            self.assertLessEqual(package.recommendation.recommended.metrics["bootstrap_gate_pass_rate"], 1.0)
+            self.assertTrue(package.recommendation.recommended.params["bootstrap_topic_share_intervals"])
             lda_candidate = next(
                 candidate for candidate in package.recommendation.candidates if candidate.params["engine"] == "lda"
             )
@@ -129,11 +141,15 @@ class PipelineTests(unittest.TestCase):
                 self.assertIn(term, model_settings)
             self.assertIn("human_review.status", model_settings)
             self.assertIn("부분표본 일치도", model_settings)
+            self.assertIn("가중치 시나리오 선정률", model_settings)
+            self.assertIn("Bootstrap 구조 관문 통과율", model_settings)
             with zipfile.ZipFile(word_path) as zf:
                 self.assertIn("word/document.xml", zf.namelist())
                 word_xml = zf.read("word/document.xml").decode("utf-8")
             self.assertIn("권장 토픽 수", word_xml)
             self.assertIn("군집 품질 종합점수", word_xml)
+            self.assertIn("가중치 시나리오 선정률", word_xml)
+            self.assertIn("Bootstrap 구조 관문 통과율", word_xml)
             self.assertNotIn("제품 추천 토픽 수", word_xml)
             with zipfile.ZipFile(ppt_path) as zf:
                 self.assertIn("ppt/presentation.xml", zf.namelist())
@@ -146,6 +162,8 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertIn("권장 토픽 수", ppt_text)
             self.assertIn("군집 품질 종합점수", ppt_text)
+            self.assertIn("가중치 시나리오 선정률", ppt_text)
+            self.assertIn("Bootstrap 구조 관문 통과율", ppt_text)
             self.assertIn("긴급성 판정이 아닙니다", ppt_text)
 
     def test_preprocessing_privacy_and_no_opinion(self) -> None:
@@ -252,15 +270,168 @@ class PipelineTests(unittest.TestCase):
             first.recommendation.recommended.params["engine"],
             first.recommendation.recommended.topic_count,
             first.recommendation.recommended.score,
+            first.recommendation.recommended.metrics["weight_acceptability"],
+            first.recommendation.recommended.metrics["bootstrap_gate_pass_rate"],
+            first.recommendation.recommended.params["bootstrap_topic_share_intervals"],
+            first.recommendation.recommended.params.get("resampling_scores", []),
             [(topic.count, topic.keywords) for topic in first.selected_topics],
         )
         second_signature = (
             second.recommendation.recommended.params["engine"],
             second.recommendation.recommended.topic_count,
             second.recommendation.recommended.score,
+            second.recommendation.recommended.metrics["weight_acceptability"],
+            second.recommendation.recommended.metrics["bootstrap_gate_pass_rate"],
+            second.recommendation.recommended.params["bootstrap_topic_share_intervals"],
+            second.recommendation.recommended.params.get("resampling_scores", []),
             [(topic.count, topic.keywords) for topic in second.selected_topics],
         )
         self.assertEqual(first_signature, second_signature)
+
+    def test_weight_sensitivity_is_bounded_reproducible_and_guides_near_ties(self) -> None:
+        def make_candidates() -> list[CandidateSolution]:
+            return [
+                CandidateSolution(
+                    candidate_id="wide",
+                    topic_count=3,
+                    params={"quality_gate_passed": True},
+                    metrics={
+                        "semantic_quality": 0.76,
+                        "coherence": 0.62,
+                        "coverage": 0.99,
+                        "diversity": 0.70,
+                        "labelability": 0.90,
+                        "balance": 0.72,
+                        "penalty": 0.01,
+                    },
+                    score=0.74,
+                ),
+                CandidateSolution(
+                    candidate_id="detailed",
+                    topic_count=4,
+                    params={"quality_gate_passed": True},
+                    metrics={
+                        "semantic_quality": 0.66,
+                        "coherence": 0.82,
+                        "coverage": 0.98,
+                        "diversity": 0.88,
+                        "labelability": 0.92,
+                        "balance": 0.80,
+                        "penalty": 0.01,
+                    },
+                    score=0.73,
+                ),
+            ]
+
+        first = make_candidates()
+        second = make_candidates()
+        _attach_weight_sensitivity(first, seed=77, scenarios=200)
+        _attach_weight_sensitivity(second, seed=77, scenarios=200)
+
+        first_metrics = [candidate.metrics for candidate in first]
+        self.assertEqual(first_metrics, [candidate.metrics for candidate in second])
+        self.assertAlmostEqual(sum(candidate.metrics["weight_acceptability"] for candidate in first), 1.0, places=2)
+        for candidate in first:
+            self.assertGreaterEqual(candidate.metrics["weight_acceptability"], 0.0)
+            self.assertLessEqual(candidate.metrics["weight_acceptability"], 1.0)
+            self.assertGreaterEqual(candidate.metrics["weight_acceptability_mcse"], 0.0)
+            self.assertLessEqual(candidate.metrics["weight_acceptability_mcse"], 0.5 / np.sqrt(200))
+            self.assertLessEqual(candidate.metrics["weight_score_p10"], candidate.metrics["weight_score_p90"])
+
+        expected = max(first, key=lambda candidate: candidate.metrics["weight_acceptability"])
+        self.assertIs(_select_recommended(first), expected)
+
+    def test_assignment_bootstrap_reports_reproducible_structural_uncertainty(self) -> None:
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=f"응답 {index}",
+                redacted_text=f"응답 {index}",
+                metadata={},
+            )
+            for index in range(20)
+        ]
+
+        def make_candidate() -> CandidateSolution:
+            topics = [
+                Topic("T01", "주제 1", "", 10, 0.5, ["주제"], ["응답 0"]),
+                Topic("T02", "주제 2", "", 10, 0.5, ["개선"], ["응답 10"]),
+            ]
+            assignments = [
+                TopicAssignment(
+                    document_id=document.id,
+                    topic_id="T01" if index < 10 else "T02",
+                    probability=1.0,
+                    is_outlier=False,
+                    assignment_source="test",
+                )
+                for index, document in enumerate(documents)
+            ]
+            return CandidateSolution(
+                candidate_id="bootstrap",
+                topic_count=2,
+                params={"min_topic_size": 3},
+                metrics={},
+                score=0.8,
+                topics=topics,
+                assignments=assignments,
+            )
+
+        first = make_candidate()
+        second = make_candidate()
+        self.assertIsNone(_attach_assignment_bootstrap(first, documents, seed=91, repeats=200))
+        self.assertIsNone(_attach_assignment_bootstrap(second, documents, seed=91, repeats=200))
+        self.assertEqual(first.metrics, second.metrics)
+        self.assertEqual(
+            first.params["bootstrap_topic_share_intervals"],
+            second.params["bootstrap_topic_share_intervals"],
+        )
+        self.assertEqual(first.params["bootstrap_status"], "evaluated")
+        self.assertGreaterEqual(first.metrics["bootstrap_gate_pass_rate"], 0.0)
+        self.assertLessEqual(first.metrics["bootstrap_gate_pass_rate"], 1.0)
+        for interval in first.params["bootstrap_topic_share_intervals"]:
+            self.assertLessEqual(interval["p025"], interval["estimate"])
+            self.assertLessEqual(interval["estimate"], interval["p975"])
+
+    def test_assignment_bootstrap_warns_for_fragile_small_topics(self) -> None:
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=f"합성 응답 {index}",
+                redacted_text=f"합성 응답 {index}",
+                metadata={},
+            )
+            for index in range(36)
+        ]
+        topics = [
+            Topic("T01", "다수", "", 30, 30 / 36, ["다수"], ["합성 응답 0"]),
+            Topic("T02", "소수 A", "", 3, 3 / 36, ["소수"], ["합성 응답 30"]),
+            Topic("T03", "소수 B", "", 3, 3 / 36, ["소수"], ["합성 응답 33"]),
+        ]
+        assignments = []
+        for index, document in enumerate(documents):
+            topic_id = "T01" if index < 30 else ("T02" if index < 33 else "T03")
+            assignments.append(TopicAssignment(document.id, topic_id, 1.0, False, "test"))
+        candidate = CandidateSolution(
+            candidate_id="fragile",
+            topic_count=3,
+            params={"min_topic_size": 3},
+            metrics={},
+            score=0.7,
+            topics=topics,
+            assignments=assignments,
+        )
+
+        warning = _attach_assignment_bootstrap(candidate, documents, seed=42, repeats=500)
+
+        self.assertIsNotNone(warning)
+        self.assertLess(candidate.metrics["bootstrap_gate_pass_rate"], 0.80)
+        rare_intervals = candidate.params["bootstrap_topic_share_intervals"][1:]
+        self.assertTrue(any(interval["p025"] == 0.0 for interval in rare_intervals))
 
     def test_user_edit_is_recorded_and_export_state_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

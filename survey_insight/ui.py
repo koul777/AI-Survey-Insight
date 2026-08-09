@@ -1194,6 +1194,7 @@ def app_html() -> str:
           <td>${candidate.metrics.coherence}</td>
           <td>${candidate.metrics.semantic_quality}</td>
           <td>${candidate.metrics.coverage}</td>
+          <td>${candidate.metrics.weight_acceptability ?? "-"}</td>
         </tr>
       `).join("");
       const warnings = [...(rec.warnings || []), ...(rec.quality_warnings || [])]
@@ -1206,7 +1207,7 @@ def app_html() -> str:
           <div class="row">${warnings}</div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>순위</th><th>토픽 수</th><th>복합 평가</th><th>엔진</th><th>구조 관문</th><th>군집 품질 종합점수</th><th>토픽 해석 가능성 점수</th><th>군집 분리도</th><th>분석 포함률</th></tr></thead>
+              <thead><tr><th>기본 점수 순위</th><th>토픽 수</th><th>복합 평가</th><th>엔진</th><th>구조 관문</th><th>군집 품질 종합점수</th><th>토픽 해석 가능성 점수</th><th>군집 분리도</th><th>분석 포함률</th><th>가중치 시나리오 선정률</th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           </div>
@@ -1251,7 +1252,7 @@ def app_html() -> str:
 
           <section class="dashboard-section">
             <p class="eyebrow">토픽 수를 정한 이유</p>
-            <h3>구조 관문·복합 평가와 별도 안정성 진단을 함께 봤습니다</h3>
+            <h3>구조 관문·복합 평가·가중치 민감도·재표본 진단을 함께 봤습니다</h3>
             <p>${escapeHtml(reason)}</p>
             <div class="score-grid">
               ${scoreCard("군집 품질 종합점수", metrics.stability, "분리도·키워드 동시출현·크기 균형을 결합한 휴리스틱이며 통계적 안정성이 아닙니다")}
@@ -1261,7 +1262,9 @@ def app_html() -> str:
               ${scoreCard("토픽 키워드 다양성", metrics.diversity, "토픽별 상위 키워드가 서로 중복되지 않는 정도")}
               ${scoreCard("라벨 해석 가능성", metrics.labelability, "키워드와 대표 응답이 라벨 검토에 충분한지 보는 휴리스틱")}
               ${scoreCard("토픽 크기 균형", metrics.balance, "한 토픽의 과도한 지배 여부를 엔트로피 기반으로 점검한 값")}
-              ${metrics.resampling_stability !== undefined ? scoreCard("부분표본 일치도", metrics.resampling_stability, "선정 후보를 80% 층화 부분표본으로 3회 다시 적합한 ARI 평균이며 권장 점수에는 포함되지 않습니다") : ""}
+              ${metrics.weight_acceptability !== undefined ? scoreCard("가중치 시나리오 선정률", metrics.weight_acceptability, "기본 가중치를 각각 50~150% 범위에서 바꾸고 재정규화한 512개 시나리오 중 같은 후보가 선택된 비율입니다. 정확도 확률이 아닙니다") : ""}
+              ${metrics.bootstrap_gate_pass_rate !== undefined ? scoreCard("Bootstrap 구조 관문 통과율", metrics.bootstrap_gate_pass_rate, "현재 토픽 배정에 조건부로 응답을 500회 복원추출했을 때 최소 크기와 포함률 관문을 유지한 비율입니다. 통계적 검정력이 아닙니다") : ""}
+              ${metrics.resampling_stability !== undefined ? scoreCard("부분표본 일치도", metrics.resampling_stability, "선정 후보를 80% 층화 부분표본으로 5회 다시 적합한 ARI 평균이며 권장 점수에는 포함되지 않습니다") : ""}
             </div>
           </section>
 

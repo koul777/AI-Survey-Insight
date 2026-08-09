@@ -24,13 +24,25 @@ METRIC_LABELS = {
     "labelability": "라벨 해석 가능성",
     "balance": "토픽 크기 균형",
     "resampling_stability": "부분표본 일치도(진단)",
+    "resampling_stability_p10": "부분표본 일치도 10백분위(진단)",
+    "resampling_stability_p90": "부분표본 일치도 90백분위(진단)",
+    "weight_acceptability": "가중치 시나리오 선정률(민감도)",
+    "weight_acceptability_mcse": "가중치 시나리오 선정률 Monte Carlo 표준오차",
+    "weight_score_p10": "가중치 시나리오 점수 10백분위",
+    "weight_score_p90": "가중치 시나리오 점수 90백분위",
+    "bootstrap_gate_pass_rate": "Bootstrap 구조 관문 통과율",
+    "bootstrap_coverage_p025": "Bootstrap 분석 포함률 2.5백분위",
+    "bootstrap_coverage_p975": "Bootstrap 분석 포함률 97.5백분위",
+    "bootstrap_balance_p025": "Bootstrap 토픽 크기 균형 2.5백분위",
+    "bootstrap_min_topic_share_p025": "Bootstrap 최소 토픽 비율 2.5백분위",
     "penalty": "품질 감점",
 }
 
 METHODOLOGY_SUMMARY = (
     "권장 토픽 수는 군집 분리도, 키워드 동시출현 기반 해석 가능성, 분석 포함률, "
     "키워드 다양성, 라벨 해석 가능성, 토픽 크기 균형을 결합한 휴리스틱으로 선정했습니다. "
-    "선정 후보에는 3회 80% 층화 부분표본 일치도를 별도 진단합니다. "
+    "가중치를 명시된 범위에서 바꾼 512개 시나리오의 선정률과 500회 assignment-conditional bootstrap을 "
+    "별도 진단하고, 선정 후보는 5회 80% 층화 부분표본으로 다시 적합합니다. "
     "통계적으로 검증된 최적값이나 정확도가 아니므로 대표 응답과 함께 담당자가 검토해야 합니다."
 )
 
@@ -174,6 +186,12 @@ def _write_model_settings(ws: Any, package: AnalysisPackage) -> None:
     ws.append(["feature_space", rec.recommended.params.get("feature_space")])
     ws.append(["metric_profile", rec.recommended.params.get("metric_profile")])
     ws.append(["quality_gate_passed", rec.recommended.params.get("quality_gate_passed")])
+    ws.append(["weight_sensitivity_profile", rec.recommended.params.get("weight_sensitivity_profile")])
+    ws.append(["weight_sensitivity_scenarios", rec.recommended.params.get("weight_sensitivity_scenarios")])
+    ws.append(["weight_multiplier_range", str(rec.recommended.params.get("weight_multiplier_range"))])
+    ws.append(["bootstrap_profile", rec.recommended.params.get("bootstrap_profile")])
+    ws.append(["bootstrap_repeats", rec.recommended.params.get("bootstrap_repeats")])
+    ws.append(["resampling_repeats", rec.recommended.params.get("resampling_repeats")])
     review = _human_review(package)
     ws.append(["human_review.status", review.get("status")])
     ws.append(["human_review.reviewer", review.get("reviewer", "")])
@@ -181,6 +199,13 @@ def _write_model_settings(ws: Any, package: AnalysisPackage) -> None:
     ws.append(["privacy_review_flag_count", package.project.get("privacy_review_flag_count", 0)])
     for key, value in rec.recommended.metrics.items():
         ws.append([f"metric.{key} ({METRIC_LABELS.get(key, key)})", value])
+    for interval in rec.recommended.params.get("bootstrap_topic_share_intervals", []):
+        ws.append(
+            [
+                f"bootstrap.topic_share.{interval.get('topic_id')}",
+                f"estimate={interval.get('estimate')}, p025={interval.get('p025')}, p975={interval.get('p975')}",
+            ]
+        )
     ws.append(["text_column", package.text_column])
     ws.append(["methodology_note", package.methodology_note])
     for label, value in _recommendation_explanations(rec):
@@ -276,7 +301,9 @@ def _ppt_methodology_slide(prs: Presentation, package: AnalysisPackage) -> None:
         f"사용 엔진: {rec.params.get('engine', 'unknown')}",
         f"허용 토픽 범위: {package.recommendation.allowed_topic_range[0]}-{package.recommendation.allowed_topic_range[1]}개",
         "표시 지표: 군집 품질 종합점수, 토픽 해석 가능성 점수, 군집 분리도, 분석 포함률, 토픽 키워드 다양성, 라벨 해석 가능성",
-        "부분표본 일치도는 선정 후보의 사후 진단이며 권장 점수에는 포함되지 않습니다.",
+        "가중치 시나리오 선정률은 512개 제한 범위 가중치 조합에서 같은 후보가 선택된 비율이며 정확도 확률이 아닙니다.",
+        "Bootstrap 구조 관문 통과율은 현재 배정에 조건부인 500회 진단이며 모집단 타당성이나 검정력이 아닙니다.",
+        "부분표본 일치도는 선정 후보의 5회 재적합 사후 진단이며 권장 점수에는 포함되지 않습니다.",
         "감정은 규칙·어휘 기반 신호이며 처리 우선도는 긴급성 판정이 아닙니다.",
         package.methodology_note,
     ]
