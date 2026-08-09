@@ -59,6 +59,12 @@ python -m pip install -r requirements.txt
 
 Windows에서는 `start_app.bat` 또는 `start_app.ps1`로 실행할 수 있습니다. 샘플 파일은 `sample_data/mock_survey_responses.csv`입니다.
 
+소스 수정이나 테스트 실행이 목적이라면 FastAPI 테스트 클라이언트용 선택 의존성까지 설치합니다. 일반 실행에는 이 추가 설치가 필요하지 않습니다.
+
+```powershell
+python -m pip install -e ".[test]"
+```
+
 ## 분석 흐름
 
 1. CSV/XLSX를 업로드하고 추천된 자유응답 컬럼을 확인합니다.
@@ -147,14 +153,17 @@ NMF/LDA는 모델 성분에서 키워드를 뽑고 문서–토픽 가중치로 
 
 ## 테스트
 
-외부 API 호출 없이 전체 테스트를 실행합니다.
+먼저 테스트용 선택 의존성을 설치한 뒤 외부 API 호출 없이 전체 테스트를 실행합니다.
 
 ```powershell
+python -m pip install -e ".[test]"
 python -m unittest discover -s tests -v
 python -m compileall survey_insight tests
 ```
 
-테스트는 API·SQLite round trip, 전처리, 토픽 후보와 구조 관문, 동일 seed 재현성, provider mock/fallback, API 키 비저장, export 개인정보 보호와 OOXML 구조, UI 핵심 문구를 확인합니다. 실제 실행 결과는 릴리스나 PR에서 명령·통과 수와 함께 기록해야 합니다.
+GitHub Actions도 같은 테스트 선택 의존성을 설치하고 Python 3.11·3.12에서 위 검사를 실행합니다. `SURVEY_INSIGHT_DISABLE_NETWORK=1`을 설정하며 provider 테스트는 mock을 사용하므로 실제 API 키나 외부 AI 호출에 의존하지 않습니다.
+
+테스트는 API·SQLite round trip, 전처리, 토픽 후보와 구조 관문, 동일 seed 재현성, provider mock/fallback, API 키 비저장, export 개인정보 보호와 OOXML 구조, UI 핵심 문구를 확인합니다. 이는 기능 동작 점검이며 분석 정확도나 통계적 타당성을 보증하지 않습니다. 실제 실행 결과는 릴리스나 PR에서 명령·통과 수와 함께 기록해야 합니다.
 
 ## 프로젝트 구조
 

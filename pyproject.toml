@@ -14,6 +14,11 @@ dependencies = [
   "uvicorn>=0.30,<1",
 ]
 
+[project.optional-dependencies]
+test = [
+  "httpx2>=2,<3",
+]
+
 [project.scripts]
 survey-insight = "survey_insight.cli:main"
 
