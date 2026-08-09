@@ -231,25 +231,24 @@ def _build_candidates(
                     natural_k,
                     min_topic_size,
                     "dbscan_lsa_natural",
-                    extra_params={"feature_space": "tfidf_lsa"},
+                    extra_params={"feature_space": "tfidf_lsa", "topic_terms": "class_tfidf"},
                 )
             )
     for k in range(lower, min(upper, n) + 1):
         labels = _cluster(matrix, k, seed)
-        if labels is None:
-            continue
-        candidates.append(
-            _candidate_from_labels(
-                documents,
-                vectorizer,
-                matrix,
-                labels,
-                k,
-                min_topic_size,
-                "kmeans",
-                extra_params={"feature_space": "tfidf"},
+        if labels is not None:
+            candidates.append(
+                _candidate_from_labels(
+                    documents,
+                    vectorizer,
+                    matrix,
+                    labels,
+                    k,
+                    min_topic_size,
+                    "kmeans",
+                    extra_params={"feature_space": "tfidf", "topic_terms": "class_tfidf"},
+                )
             )
-        )
         if n <= 250 and k > 1:
             agglom_labels = _cluster_agglomerative(matrix, k)
             if agglom_labels is not None:
@@ -262,7 +261,7 @@ def _build_candidates(
                         k,
                         min_topic_size,
                         "agglomerative",
-                        extra_params={"feature_space": "tfidf"},
+                        extra_params={"feature_space": "tfidf", "topic_terms": "class_tfidf"},
                     )
                 )
         nmf_solution = _fit_nmf(matrix, k, seed)
@@ -279,7 +278,32 @@ def _build_candidates(
                     "nmf",
                     document_topic_weights=nmf_weights,
                     topic_components=nmf_components,
-                    extra_params={"feature_space": "tfidf", "topic_terms": "nmf_components"},
+                    extra_params={
+                        "feature_space": "tfidf",
+                        "topic_terms": "nmf_components_distinct_ngrams",
+                        "nmf_objective": "frobenius",
+                    },
+                )
+            )
+        nmf_kl_solution = _fit_nmf(matrix, k, seed, objective="kullback-leibler")
+        if nmf_kl_solution is not None:
+            nmf_kl_labels, nmf_kl_weights, nmf_kl_components = nmf_kl_solution
+            candidates.append(
+                _candidate_from_labels(
+                    documents,
+                    vectorizer,
+                    matrix,
+                    nmf_kl_labels,
+                    k,
+                    min_topic_size,
+                    "nmf_kl",
+                    document_topic_weights=nmf_kl_weights,
+                    topic_components=nmf_kl_components,
+                    extra_params={
+                        "feature_space": "tfidf",
+                        "topic_terms": "nmf_components_distinct_ngrams",
+                        "nmf_objective": "generalized_kullback_leibler",
+                    },
                 )
             )
         lda_solution = _fit_lda(count_matrix, k, seed)
@@ -297,7 +321,10 @@ def _build_candidates(
                     metric_matrix=matrix,
                     document_topic_weights=lda_weights,
                     topic_components=lda_components,
-                    extra_params={"feature_space": "term_count", "topic_terms": "lda_components"},
+                    extra_params={
+                        "feature_space": "term_count",
+                        "topic_terms": "lda_components_distinct_ngrams",
+                    },
                 )
             )
     return candidates
@@ -335,6 +362,7 @@ def _build_embedding_candidates(
                         "embedding_source": embedding_source,
                         "embedding_model": embedding_model,
                         "feature_space": "embedding",
+                        "topic_terms": "class_tfidf",
                     },
                 )
             )
@@ -355,6 +383,7 @@ def _build_embedding_candidates(
                         "embedding_source": embedding_source,
                         "embedding_model": embedding_model,
                         "feature_space": "embedding",
+                        "topic_terms": "class_tfidf",
                     },
                 )
             )
@@ -374,6 +403,7 @@ def _build_embedding_candidates(
                         "embedding_source": embedding_source,
                         "embedding_model": embedding_model,
                         "feature_space": "embedding",
+                        "topic_terms": "class_tfidf",
                     },
                 )
             )
@@ -479,7 +509,12 @@ def _cluster_embedding_dbscan_candidates(matrix: np.ndarray, min_topic_size: int
     return candidates
 
 
-def _fit_nmf(matrix: Any, k: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+def _fit_nmf(
+    matrix: Any,
+    k: int,
+    seed: int,
+    objective: str = "frobenius",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     n_docs, n_features = matrix.shape
     if k <= 1:
         weights = np.ones((n_docs, 1), dtype=float)
@@ -488,7 +523,22 @@ def _fit_nmf(matrix: Any, k: int, seed: int) -> tuple[np.ndarray, np.ndarray, np
     if n_docs < k or n_features < k:
         return None
     init = "nndsvda" if min(n_docs, n_features) > k else "random"
-    model = NMF(n_components=k, init=init, random_state=seed, max_iter=600)
+    if objective == "frobenius":
+        model = NMF(n_components=k, init=init, random_state=seed, max_iter=600)
+    elif objective == "kullback-leibler":
+        model = NMF(
+            n_components=k,
+            init=init,
+            random_state=seed,
+            solver="mu",
+            beta_loss="kullback-leibler",
+            max_iter=1000,
+            alpha_W=0.00005,
+            alpha_H=0.00005,
+            l1_ratio=0.5,
+        )
+    else:
+        raise ValueError(f"Unsupported NMF objective: {objective}")
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", ConvergenceWarning)
@@ -595,7 +645,7 @@ def _candidate_from_labels(
             "engine": source,
             "min_topic_size": min_topic_size,
             "tokenizer": tokenizer_source(),
-            "metric_profile": "heuristic_v3_weight_sensitivity_bootstrap",
+            "metric_profile": "heuristic_v4_topic_representation",
             "requested_topic_count": k,
             "quality_gate_passed": not quality_gate_reasons,
             "quality_gate_reasons": quality_gate_reasons,
@@ -622,6 +672,7 @@ def _topics_from_labels(
         if int(label) == -1:
             continue
         label_to_indices[int(label)].append(idx)
+    class_term_scores = _class_tfidf_scores(documents, labels, vectorizer)
     topics: list[Topic] = []
     topic_ids: dict[int, str] = {}
     for order, (label, indices) in enumerate(sorted(label_to_indices.items()), start=1):
@@ -629,8 +680,7 @@ def _topics_from_labels(
         topic_ids[label] = topic_id
         sub_matrix = matrix[indices]
         mean_vector = np.asarray(sub_matrix.mean(axis=0)).ravel()
-        top_indices = mean_vector.argsort()[::-1][:8]
-        keywords = [feature_names[i] for i in top_indices if mean_vector[i] > 0][:6]
+        keywords = _select_distinct_keywords(feature_names, class_term_scores.get(label, mean_vector))
         reps = _representative_responses([documents[i] for i in indices], sub_matrix, mean_vector)
         topic_label = label_topic(keywords, reps)
         sentiment = aggregate_topic_sentiment([documents[i].redacted_text for i in indices])
@@ -679,8 +729,7 @@ def _topics_from_components(
     for label in active_labels:
         indices = np.flatnonzero(labels == label)
         component = np.asarray(topic_components[label], dtype=float).ravel()
-        top_indices = component.argsort()[::-1][:8]
-        keywords = [str(feature_names[index]) for index in top_indices if component[index] > 0][:6]
+        keywords = _select_distinct_keywords(feature_names, component)
         ranked = sorted(indices.tolist(), key=lambda index: float(document_topic_weights[index, label]), reverse=True)
         reps: list[str] = []
         for index in ranked:
@@ -725,6 +774,98 @@ def _topics_from_components(
             )
         )
     return topics, assignments
+
+
+def _class_tfidf_scores(
+    documents: list[TextDocument],
+    labels: np.ndarray,
+    vectorizer: TfidfVectorizer | CountVectorizer,
+) -> dict[int, np.ndarray]:
+    """Score terms after treating each model cluster as one class document.
+
+    Counts are collected per original response so that word bigrams never cross
+    response boundaries. This is a topic-representation step; it does not alter
+    the fitted assignments or their evaluation metrics.
+    """
+
+    vocabulary = vectorizer.vocabulary_
+    analyzer = vectorizer.build_analyzer()
+    active_labels = sorted({int(label) for label in labels if int(label) != -1})
+    if not active_labels or not vocabulary:
+        return {}
+    row_by_label = {label: row for row, label in enumerate(active_labels)}
+    counts = np.zeros((len(active_labels), len(vocabulary)), dtype=float)
+    for document, raw_label in zip(documents, labels):
+        label = int(raw_label)
+        if label == -1:
+            continue
+        row = row_by_label[label]
+        for term in analyzer(document.redacted_text):
+            column = vocabulary.get(term)
+            if column is not None:
+                counts[row, column] += 1.0
+    class_lengths = counts.sum(axis=1)
+    total_terms = float(class_lengths.sum())
+    if total_terms <= 0:
+        return {}
+    class_tf = np.divide(
+        counts,
+        class_lengths[:, np.newaxis],
+        out=np.zeros_like(counts),
+        where=class_lengths[:, np.newaxis] > 0,
+    )
+    average_class_length = total_terms / len(active_labels)
+    global_term_counts = counts.sum(axis=0)
+    inverse_class_frequency = np.log1p(
+        np.divide(
+            average_class_length,
+            global_term_counts,
+            out=np.zeros_like(global_term_counts),
+            where=global_term_counts > 0,
+        )
+    )
+    scores = class_tf * inverse_class_frequency
+    return {label: scores[row] for label, row in row_by_label.items()}
+
+
+def _select_distinct_keywords(
+    feature_names: np.ndarray,
+    scores: np.ndarray,
+    limit: int = 6,
+    pool_size: int = 30,
+) -> list[str]:
+    """Select high-scoring terms while suppressing word n-gram containment."""
+
+    values = np.asarray(scores, dtype=float).ravel()
+    if values.size == 0:
+        return []
+    ranked = np.argsort(-values, kind="stable")[: max(limit, pool_size)]
+    selected: list[str] = []
+    for index in ranked:
+        if values[index] <= 0:
+            continue
+        candidate = str(feature_names[index]).strip()
+        if not candidate or _is_redundant_keyword(candidate, selected):
+            continue
+        selected.append(candidate)
+        if len(selected) == limit:
+            break
+    return selected
+
+
+def _is_redundant_keyword(candidate: str, selected: list[str]) -> bool:
+    candidate_tokens = tuple(candidate.split())
+    candidate_set = set(candidate_tokens)
+    for existing in selected:
+        if candidate == existing:
+            return True
+        existing_tokens = tuple(existing.split())
+        if len(candidate_tokens) == 1 and len(existing_tokens) == 1:
+            continue
+        existing_set = set(existing_tokens)
+        if candidate_set <= existing_set or existing_set <= candidate_set:
+            return True
+    return False
 
 
 def _representative_responses(
@@ -1216,6 +1357,9 @@ def _refit_candidate_labels(
         return _cluster_agglomerative(tfidf_matrix, topic_count)
     if engine == "nmf":
         solution = _fit_nmf(tfidf_matrix, topic_count, seed)
+        return solution[0] if solution is not None else None
+    if engine == "nmf_kl":
+        solution = _fit_nmf(tfidf_matrix, topic_count, seed, objective="kullback-leibler")
         return solution[0] if solution is not None else None
     if engine == "lda":
         solution = _fit_lda(count_matrix, topic_count, seed)

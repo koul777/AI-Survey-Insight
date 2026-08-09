@@ -29,11 +29,14 @@ from survey_insight.preprocessing import (
 from survey_insight.topics import (
     _attach_assignment_bootstrap,
     _attach_weight_sensitivity,
+    _build_candidates,
+    _class_tfidf_scores,
     _cluster,
     _coherence,
     _count_vectorize,
     _fit_nmf,
     _lda_input_diagnostics,
+    _select_distinct_keywords,
     _silhouette,
     _select_recommended,
     topic_policy,
@@ -41,6 +44,94 @@ from survey_insight.topics import (
 
 
 class PipelineTests(unittest.TestCase):
+    def test_distinct_keyword_selection_removes_word_ngram_containment(self) -> None:
+        features = np.asarray(["캠페인", "성과", "캠페인 성과", "교육", "지원", "문화", "보상"])
+        scores = np.asarray([0.9, 0.8, 1.0, 0.7, 0.6, 0.5, 0.4])
+
+        keywords = _select_distinct_keywords(features, scores, limit=5)
+
+        self.assertIn("캠페인 성과", keywords)
+        self.assertNotIn("캠페인", keywords)
+        self.assertNotIn("성과", keywords)
+        self.assertEqual(len(keywords), 5)
+
+    def test_class_tfidf_emphasizes_cluster_specific_terms(self) -> None:
+        texts = ["공통 사과 사과 사과", "공통 사과 사과", "공통 배 배 배", "공통 배 배"]
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=text,
+                redacted_text=text,
+                metadata={},
+            )
+            for index, text in enumerate(texts)
+        ]
+        vectorizer = CountVectorizer(token_pattern=r"(?u)\b\w+\b")
+        vectorizer.fit(texts)
+        labels = np.asarray([0, 0, 1, 1])
+
+        scores = _class_tfidf_scores(documents, labels, vectorizer)
+        vocabulary = vectorizer.vocabulary_
+
+        self.assertGreater(scores[0][vocabulary["사과"]], scores[0][vocabulary["공통"]])
+        self.assertGreater(scores[1][vocabulary["배"]], scores[1][vocabulary["공통"]])
+
+    def test_nmf_candidates_are_evaluated_when_kmeans_collapses(self) -> None:
+        texts = ["alpha apple", "alpha apricot", "beta banana", "beta berry"]
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=text,
+                redacted_text=text,
+                metadata={},
+            )
+            for index, text in enumerate(texts)
+        ]
+        vectorizer = CountVectorizer()
+        matrix = vectorizer.fit_transform(texts)
+        labels = np.asarray([0, 0, 1, 1])
+        weights = np.asarray([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
+        components = np.ones((2, matrix.shape[1]), dtype=float)
+
+        def fake_candidate(*args: object, **kwargs: object) -> CandidateSolution:
+            source = str(args[6])
+            return CandidateSolution(
+                candidate_id=source,
+                topic_count=2,
+                params={"engine": source, **dict(kwargs.get("extra_params", {}))},
+                metrics={},
+                score=0.0,
+            )
+
+        with (
+            patch("survey_insight.topics._cluster", return_value=None),
+            patch("survey_insight.topics._cluster_dbscan_candidates", return_value=[]),
+            patch("survey_insight.topics._cluster_agglomerative", return_value=None),
+            patch("survey_insight.topics._fit_nmf", return_value=(labels, weights, components)) as fit_nmf,
+            patch("survey_insight.topics._fit_lda", return_value=None),
+            patch("survey_insight.topics._candidate_from_labels", side_effect=fake_candidate),
+        ):
+            candidates = _build_candidates(
+                documents,
+                vectorizer,
+                matrix,
+                vectorizer,
+                matrix,
+                (2, 2),
+                min_topic_size=2,
+                seed=42,
+            )
+
+        engines = {candidate.params["engine"] for candidate in candidates}
+        self.assertEqual(engines, {"nmf", "nmf_kl"})
+        self.assertEqual(candidates[0].params["nmf_objective"], "frobenius")
+        self.assertEqual(candidates[1].params["nmf_objective"], "generalized_kullback_leibler")
+        self.assertEqual(fit_nmf.call_count, 2)
+
     def test_nonconverged_nmf_candidate_is_rejected(self) -> None:
         class NonConvergingNMF:
             def __init__(self, **_: object) -> None:
@@ -76,6 +167,7 @@ class PipelineTests(unittest.TestCase):
             engines = {candidate.params["engine"] for candidate in package.recommendation.candidates}
             self.assertIn("kmeans", engines)
             self.assertIn("nmf", engines)
+            self.assertIn("nmf_kl", engines)
             self.assertIn("lda", engines)
             self.assertTrue(package.recommendation.recommended.params["quality_gate_passed"])
             resampling_status = package.recommendation.recommended.params["resampling_status"]
@@ -99,7 +191,7 @@ class PipelineTests(unittest.TestCase):
                 candidate for candidate in package.recommendation.candidates if candidate.params["engine"] == "lda"
             )
             self.assertEqual(lda_candidate.params["feature_space"], "term_count")
-            self.assertEqual(lda_candidate.params["topic_terms"], "lda_components")
+            self.assertEqual(lda_candidate.params["topic_terms"], "lda_components_distinct_ngrams")
             self.assertTrue(all(topic.keywords for topic in lda_candidate.topics))
             self.assertTrue(any(0.0 < assignment.probability < 1.0 for assignment in lda_candidate.assignments))
             self.assertTrue(package.recommendation.plain_language_summary)

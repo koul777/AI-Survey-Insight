@@ -110,6 +110,7 @@ class UiHtmlTests(unittest.TestCase):
             "군집 분리도",
             "분석 포함률",
             "토픽 키워드 다양성",
+            "KL-NMF 토픽모델",
             "라벨 해석 가능성",
             "구조 관문",
         ]

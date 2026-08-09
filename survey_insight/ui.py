@@ -1259,7 +1259,7 @@ def app_html() -> str:
               ${scoreCard("토픽 해석 가능성 점수", metrics.coherence, "상위 키워드가 같은 문서에서 함께 나타나는 정도를 이용한 UMass 방식의 휴리스틱")}
               ${scoreCard("군집 분리도", metrics.semantic_quality, "노이즈 응답을 제외한 cosine silhouette의 음수를 0으로 제한한 값")}
               ${scoreCard("분석 포함률", metrics.coverage, "노이즈로 제외되지 않고 토픽에 배정된 유효 응답 비율")}
-              ${scoreCard("토픽 키워드 다양성", metrics.diversity, "토픽별 상위 키워드가 서로 중복되지 않는 정도")}
+              ${scoreCard("토픽 키워드 다양성", metrics.diversity, "단어·구 포함 중복을 줄인 뒤 토픽별 상위 키워드가 서로 겹치지 않는 정도")}
               ${scoreCard("라벨 해석 가능성", metrics.labelability, "키워드와 대표 응답이 라벨 검토에 충분한지 보는 휴리스틱")}
               ${scoreCard("토픽 크기 균형", metrics.balance, "한 토픽의 과도한 지배 여부를 엔트로피 기반으로 점검한 값")}
               ${metrics.weight_acceptability !== undefined ? scoreCard("가중치 시나리오 선정률", metrics.weight_acceptability, "기본 가중치를 각각 50~150% 범위에서 바꾸고 재정규화한 512개 시나리오 중 같은 후보가 선택된 비율입니다. 정확도 확률이 아닙니다") : ""}
@@ -1454,6 +1454,7 @@ def app_html() -> str:
         kmeans: "KMeans 군집",
         agglomerative: "계층 군집",
         nmf: "NMF 토픽모델",
+        nmf_kl: "KL-NMF 토픽모델",
         lda: "LDA 토픽모델",
         openai_embedding_kmeans: "OpenAI 의미 임베딩",
         openai_embedding_agglomerative: "OpenAI 의미 임베딩",

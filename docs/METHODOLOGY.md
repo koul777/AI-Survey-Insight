@@ -46,6 +46,7 @@ text_score =
 | LDA | 정수 단어 빈도 | 같은 어휘 규칙의 `CountVectorizer`; TF-IDF를 LDA에 넣지 않음 |
 | 로컬 DBSCAN | TF-IDF → Truncated SVD → 정규화 | 최대 10개 SVD 성분, cosine 거리 |
 | 선택적 의미 군집 | provider embedding | KMeans·계층 군집·DBSCAN 후보에 사용 |
+| 하드 군집 키워드 표현 | class-based TF-IDF | 군집별 단어 빈도를 합쳐 군집 고유 표현을 강조; 배정에는 영향 없음 |
 
 어휘 행렬을 만들 수 없는 극단적으로 짧은 텍스트에서는 문자 2–4그램으로 대체합니다. 문자 대체가 발생하면 형태소 기반 결과와 해석 방식이 다르므로 토크나이저 기록을 확인해야 합니다.
 
@@ -64,12 +65,21 @@ text_score =
 
 - **KMeans**: TF-IDF 또는 선택적 embedding에서 고정 `k` 후보를 생성합니다. 수렴 경고가 발생하거나 요청한 수보다 실제 군집 수가 적게 만들어진 붕괴 후보는 버립니다.
 - **계층 군집**: 평균 연결과 cosine 거리를 사용합니다. TF-IDF와 embedding 모두 응답 250건 이하에서만 실행해 밀집 행렬 메모리 사용을 제한합니다.
-- **NMF**: TF-IDF의 비음수 행렬을 분해합니다. 문서–토픽 가중치의 최댓값으로 주 토픽을 정하고, **NMF 성분 자체**에서 상위 단어를 뽑습니다. 최대 반복 횟수 안에 수렴하지 않은 후보는 경쟁표에서 제외합니다.
+- **Frobenius NMF**: TF-IDF의 비음수 행렬을 Frobenius 손실로 분해합니다. 문서–토픽 가중치의 최댓값으로 주 토픽을 정하고, **NMF 성분 자체**에서 상위 단어를 뽑습니다.
+- **KL-NMF**: 같은 TF-IDF 행렬에 multiplicative update와 일반화 Kullback–Leibler 손실을 적용한 별도 후보입니다. scikit-learn의 토픽 추출 예제와 같이 희소성 정규화를 함께 사용합니다. 두 NMF 모두 최대 반복 횟수 안에 수렴하지 않거나 실제 토픽 수가 붕괴하면 경쟁표에서 제외합니다.
 - **LDA**: 정수 단어 빈도 행렬을 batch 방식으로 적합합니다. 문서별 사후 토픽 분포의 최댓값으로 주 토픽을 정하고, **LDA 토픽–단어 성분 자체**에서 상위 단어를 뽑습니다. LDA는 [Blei, Ng, Jordan (2003)](https://www.jmlr.org/papers/v3/blei03a.html)의 생성 확률 모델 계열이지만, 이 제품은 짧은 설문 응답에 맞춘 탐색 도구이지 논문의 가정을 검증하는 도구는 아닙니다.
 - **DBSCAN**: 정해진 `k` 대신 밀도에서 자연 군집 수를 얻습니다. 로컬 TF-IDF 후보는 `eps=0.35–0.75`, embedding 후보는 `eps=0.15–0.35`의 제한된 격자를 비교합니다. `-1`은 노이즈 응답으로 남깁니다.
 - **선택적 embedding**: 사용자가 provider와 키를 제공한 경우에만 의미 벡터 후보를 추가합니다. provider 호출이 실패하거나 Claude처럼 별도 embedding 경로가 없는 설정이면 로컬 후보만 사용합니다.
 
-scikit-learn도 토픽 추출 예제에서 [NMF에는 TF-IDF, LDA에는 단어 빈도](https://scikit-learn.org/stable/auto_examples/applications/plot_topics_extraction_with_nmf_lda.html)를 사용합니다. 본 구현은 이 입력 구분을 따릅니다.
+scikit-learn도 토픽 추출 예제에서 [Frobenius NMF와 일반화 KL-NMF에는 TF-IDF, LDA에는 단어 빈도](https://scikit-learn.org/stable/auto_examples/applications/plot_topics_extraction_with_nmf_lda.html)를 비교합니다. 본 구현은 이 입력 구분과 두 NMF 목적함수 구분을 따릅니다. 한 엔진이 특정 `k`에서 붕괴하더라도 다른 엔진은 독립적으로 계속 평가합니다.
+
+### 5.1 토픽 키워드 표현
+
+- KMeans·계층 군집·DBSCAN 및 embedding 군집은 각 군집을 하나의 class document로 보고 class-based TF-IDF를 계산합니다. 원 응답별로 토큰을 센 뒤 군집별로 합치므로 서로 다른 응답 사이에서 가짜 bigram을 만들지 않습니다.
+- 이 계산은 [BERTopic의 class-based TF-IDF 표현](https://arxiv.org/abs/2203.05794) 아이디어를 현재 군집 결과에 적용한 것입니다. transformer·UMAP·HDBSCAN을 추가한 것이 아니며 BERTopic 전체 구현이라고 부르지 않습니다.
+- NMF·LDA는 잠재 성분 가중치를 그대로 키워드 점수로 사용합니다.
+- 모든 엔진은 상위 후보에서 `캠페인`과 `캠페인 성과`처럼 한쪽 토큰 집합이 다른 쪽에 포함되는 1–2그램을 함께 표시하지 않습니다. 문자 n-gram fallback에는 이 단어 단위 포함 규칙을 적용하지 않습니다.
+- 키워드 표현 단계는 군집 배정이나 문서–토픽 가중치를 변경하지 않습니다. 읽기 쉬운 라벨 근거를 만드는 후처리이며, 사람이 대표 응답과 함께 검토해야 합니다.
 
 ## 6. 구조 관문
 
@@ -93,7 +103,7 @@ scikit-learn도 토픽 추출 예제에서 [NMF에는 TF-IDF, LDA에는 단어 �
 | 토픽 해석 가능성 점수 | `coherence` | 상위 5개 키워드의 문서 동시출현으로 계산한 bounded UMass-style 값 |
 | 군집 분리도 | `semantic_quality` | 노이즈를 제외한 cosine silhouette. 음수는 0으로 제한 |
 | 분석 포함률 | `coverage` | `-1` 노이즈가 아닌 응답 수 / 유효 응답 수 |
-| 토픽 키워드 다양성 | `diversity` | 토픽별 상위 5개 키워드 중 고유 키워드 비율 |
+| 토픽 키워드 다양성 | `diversity` | 단어·구 포함 중복을 억제한 뒤 토픽별 상위 5개 키워드 중 고유 키워드 비율 |
 | 라벨 해석 가능성 | `labelability` | 토픽당 최대 5개 키워드(60%)와 최대 3개 대표 응답(40%)의 존재량 |
 | 토픽 크기 균형 | `balance` | 토픽 크기의 정규화 엔트로피에서 65% 초과 최대 점유율을 감점 |
 | 가중치 시나리오 선정률 | `weight_acceptability` | 구조 관문을 통과한 후보를 대상으로 기본 가중치 각각을 50–150% 범위에서 변동·재정규화한 512개 시나리오 중 해당 후보가 선택된 비율. 정확도 확률이 아님 |
@@ -190,6 +200,7 @@ priority_to_review = 1 - product(1 - matched_weight)
 ## 12. 알려진 한계와 전문가 검토 질문
 
 - 짧은 자유응답에서는 단어 동시출현이 희박해 LDA와 coherence가 불안정할 수 있습니다.
+- class-based TF-IDF와 단어·구 중복 억제는 키워드 해석을 돕는 표현 단계일 뿐 토픽의 의미적 정답성을 검증하지 않습니다.
 - Kiwi 명사 중심 처리로 서술어, 부정 범위, 문맥, 신조어 일부가 손실될 수 있습니다.
 - 서로 다른 표현 공간의 silhouette 값은 완전히 동등한 척도가 아닙니다. embedding 후보와 TF-IDF 후보의 점수 차이는 대표 응답과 함께 판단해야 합니다.
 - 500회 bootstrap은 선택된 배정을 고정한 조건부 진단이고, 5회 80% 층화 부분표본만 모델을 다시 적합합니다. 시간 순서·기관 간 이동·신규 표본 재현성을 평가하지 않습니다.

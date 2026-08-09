@@ -10,6 +10,7 @@ ENGINE_LABELS = {
     "kmeans": "KMeans 군집",
     "agglomerative": "계층 군집",
     "nmf": "NMF 토픽모델",
+    "nmf_kl": "KL-NMF 토픽모델",
     "lda": "LDA 토픽모델",
     "openai_embedding_kmeans": "OpenAI 의미 임베딩 KMeans",
     "openai_embedding_agglomerative": "OpenAI 의미 임베딩 계층 군집",

@@ -19,7 +19,10 @@ python -m compileall survey_insight tests
 - 이메일·휴대전화 번호·사번 패턴 마스킹
 - LDA가 TF-IDF가 아닌 정수 단어 빈도를 입력으로 사용함
 - KMeans의 군집 붕괴 후보 제외
+- 한 엔진이 붕괴해도 같은 토픽 수의 다른 엔진 후보를 계속 평가하는지
+- Frobenius NMF와 일반화 KL-NMF 후보의 목적함수 기록
 - DBSCAN 노이즈 제외 후 cosine silhouette 계산
+- class-based TF-IDF의 군집 고유어 강조와 단어·구 포함 중복 억제
 - 키워드 문서 동시출현 기반 토픽 해석 가능성 점수
 - LDA 성분 키워드와 0–1 문서–토픽 배정값
 - 허용 토픽 수 범위와 소표본 경고
@@ -56,7 +59,7 @@ python -m survey_insight.cli demo --out .\out_evaluation --seed 42
 
 1. `analysis_package.json`에 `dataset_profile`, `recommendation`, `selected_topics`, `assignments`가 존재합니다.
 2. 권장 토픽 수가 `recommendation.allowed_topic_range` 안에 있습니다.
-3. `recommendation.candidates`에 로컬 KMeans, NMF, LDA 후보가 생성됩니다. 데이터 구조에 따라 계층 군집·DBSCAN 후보 수는 달라질 수 있습니다.
+3. `recommendation.candidates`에 로컬 KMeans, Frobenius NMF, KL-NMF, LDA 후보가 생성됩니다. 데이터 구조나 수렴 여부에 따라 계층 군집·DBSCAN 및 각 엔진의 후보 수는 달라질 수 있습니다.
 4. 권장 후보의 `params.feature_space`와 `params.metric_profile`로 입력 표현과 평가 버전을 추적할 수 있습니다.
 5. 권장 후보에 `metrics.weight_acceptability`, `metrics.bootstrap_gate_pass_rate`, `params.bootstrap_topic_share_intervals`가 있으며 모두 선언된 범위 안에 있습니다.
 6. 각 토픽에 키워드와 최대 3개의 대표 응답이 생성됩니다.
