@@ -9,16 +9,13 @@ from typing import Any
 
 from .explanations import apply_topic_explanation
 from .models import AnalysisPackage, Topic
-
-
-OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-GEMINI_GENERATE_CONTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_OPENAI_MODEL = "gpt-5.5"
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
-DEFAULT_AZURE_API_VERSION = "2024-10-21"
+from .provider_config import (
+    ANTHROPIC_MESSAGES_URL,
+    DEFAULT_AZURE_API_VERSION,
+    GEMINI_API_BASE_URL,
+    OPENAI_RESPONSES_URL,
+    provider_config,
+)
 VALID_SENTIMENT_LABELS = {"positive", "neutral", "negative", "mixed"}
 
 
@@ -40,7 +37,6 @@ def enhance_with_user_llm(
         return ["Provider가 선택되었지만 API Key가 없어 로컬 해석만 사용했습니다."]
     if _looks_like_placeholder_key(api_key):
         return ["테스트 또는 예시 API Key로 보여 외부 호출을 생략하고 로컬 해석만 사용했습니다."]
-
     try:
         request = _chat_request(provider_name, base_url, model, azure_api_version)
         payload = _build_provider_payload(package, request)
@@ -61,7 +57,8 @@ def _chat_request(
 ) -> dict[str, Any]:
     selected_model = (model or "").strip()
     if provider_name == "openai":
-        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        default_model = provider_config("openai").default_chat_model or ""
+        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_OPENAI_MODEL", default_model)
         return {
             "url": OPENAI_RESPONSES_URL,
             "header_mode": "bearer",
@@ -71,9 +68,10 @@ def _chat_request(
             "source": "openai_llm",
         }
     if provider_name == "gemini":
-        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        default_model = provider_config("gemini").default_chat_model or ""
+        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_GEMINI_MODEL", default_model)
         return {
-            "url": f"{GEMINI_GENERATE_CONTENT_BASE_URL}/models/{model_name}:generateContent",
+            "url": f"{GEMINI_API_BASE_URL}/models/{model_name}:generateContent",
             "header_mode": "gemini",
             "payload_model": model_name,
             "model_label": model_name,
@@ -81,7 +79,8 @@ def _chat_request(
             "source": "gemini_llm",
         }
     if provider_name == "claude":
-        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
+        default_model = provider_config("claude").default_chat_model or ""
+        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_CLAUDE_MODEL", default_model)
         return {
             "url": ANTHROPIC_MESSAGES_URL,
             "header_mode": "anthropic",
@@ -104,7 +103,8 @@ def _chat_request(
         }
     if provider_name in {"custom", "openai_compatible"}:
         endpoint = _require_url(base_url, "OpenAI-compatible base URL")
-        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        default_model = provider_config("openai_compatible").default_chat_model or ""
+        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_OPENAI_MODEL", default_model)
         return {
             "url": f"{endpoint}/chat/completions",
             "header_mode": "bearer",
@@ -167,7 +167,9 @@ def _system_prompt() -> str:
         "topic-level sentiment and urgency classification. Use local sentiment values only as hints. "
         "Base every sentiment label, urgency score, and suggested action on the provided keywords, "
         "representative responses, counts, and evidence terms. "
-        "Do not invent facts, departments, policies, or root causes."
+        "Call the topic count a recommendation, never a statistically optimal or validated value. "
+        "Describe urgency_score only as priority-to-review, never an emergency, risk, clinical, or psychological diagnosis. "
+        "Do not claim complete anonymization. Do not invent facts, departments, policies, or root causes."
     )
 
 
@@ -215,6 +217,8 @@ def _topic_payload(topic: Topic) -> dict[str, Any]:
 
 
 def _post_chat_completion(api_key: str, request_settings: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    if os.environ.get("SURVEY_INSIGHT_DISABLE_NETWORK", "").strip().casefold() in {"1", "true", "yes"}:
+        raise RuntimeError("External network calls are disabled.")
     headers = {"Content-Type": "application/json"}
     header_mode = request_settings.get("header_mode")
     if header_mode == "azure":
@@ -336,16 +340,45 @@ def _apply_sentiment_item(topic: Topic, item: dict[str, Any], llm_source: str) -
     sentiment_label = str(item.get("sentiment_label") or "").casefold()
     urgency_score = _optional_score(item.get("urgency_score"))
     sentiment_score = _optional_signed_score(item.get("sentiment_score"))
-    if sentiment_label not in VALID_SENTIMENT_LABELS or urgency_score is None:
+    evidence = item.get("sentiment_evidence")
+    grounded_evidence = _grounded_sentiment_evidence(topic, evidence)
+    if (
+        sentiment_label not in VALID_SENTIMENT_LABELS
+        or urgency_score is None
+        or sentiment_score is None
+        or not grounded_evidence
+        or not _sentiment_label_matches_score(sentiment_label, sentiment_score)
+    ):
         return
     topic.sentiment_label = sentiment_label
     topic.sentiment_method = f"{llm_source}_evidence"
     topic.urgency_score = urgency_score
-    if sentiment_score is not None:
-        topic.sentiment_score = sentiment_score
-    evidence = item.get("sentiment_evidence")
-    if isinstance(evidence, list):
-        topic.sentiment_evidence = [_clean_text(value, "", max_length=40) for value in evidence if value][:8]
+    topic.sentiment_score = sentiment_score
+    topic.sentiment_evidence = grounded_evidence
+
+
+def _grounded_sentiment_evidence(topic: Topic, evidence: Any) -> list[str]:
+    if not isinstance(evidence, list):
+        return []
+    source = " ".join(
+        [*topic.keywords, *topic.representative_responses, *topic.sentiment_evidence]
+    ).casefold()
+    grounded: list[str] = []
+    for value in evidence:
+        cleaned = _clean_text(value, "", max_length=40)
+        if cleaned and cleaned.casefold() in source and cleaned not in grounded:
+            grounded.append(cleaned)
+    return grounded[:8]
+
+
+def _sentiment_label_matches_score(label: str, score: float) -> bool:
+    if label == "positive":
+        return score >= 0.15
+    if label == "negative":
+        return score <= -0.15
+    if label == "neutral":
+        return -0.15 < score < 0.15
+    return label == "mixed"
 
 
 def _copy_topic_interpretation(source: Topic, target: Topic) -> None:
@@ -367,7 +400,9 @@ def _optional_score(value: Any) -> float | None:
         score = float(value)
     except (TypeError, ValueError):
         return None
-    return round(max(0.0, min(1.0, score)), 3)
+    if not 0.0 <= score <= 1.0:
+        return None
+    return round(score, 3)
 
 
 def _optional_signed_score(value: Any) -> float | None:
@@ -375,7 +410,9 @@ def _optional_signed_score(value: Any) -> float | None:
         score = float(value)
     except (TypeError, ValueError):
         return None
-    return round(max(-1.0, min(1.0, score)), 3)
+    if not -1.0 <= score <= 1.0:
+        return None
+    return round(score, 3)
 
 
 def _clean_text(value: Any, fallback: str, max_length: int = 500) -> str:

@@ -10,12 +10,12 @@ from typing import Sequence
 import numpy as np
 from sklearn.preprocessing import Normalizer
 
-
-OPENAI_EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
-GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
-DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
-DEFAULT_AZURE_API_VERSION = "2024-10-21"
+from .provider_config import (
+    DEFAULT_AZURE_API_VERSION,
+    GEMINI_API_BASE_URL,
+    OPENAI_EMBEDDINGS_URL,
+    provider_config,
+)
 
 
 @dataclass(frozen=True)
@@ -74,7 +74,8 @@ def _embedding_request(
 ) -> dict[str, object]:
     selected_model = (model or "").strip()
     if provider_name == "openai":
-        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_OPENAI_EMBEDDING_MODEL", DEFAULT_OPENAI_EMBEDDING_MODEL)
+        default_model = provider_config("openai").default_embedding_model or ""
+        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_OPENAI_EMBEDDING_MODEL", default_model)
         return {
             "url": OPENAI_EMBEDDINGS_URL,
             "header_mode": "bearer",
@@ -84,7 +85,8 @@ def _embedding_request(
             "provider_type": "openai_compatible",
         }
     if provider_name == "gemini":
-        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_GEMINI_EMBEDDING_MODEL", DEFAULT_GEMINI_EMBEDDING_MODEL)
+        default_model = provider_config("gemini").default_embedding_model or ""
+        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_GEMINI_EMBEDDING_MODEL", default_model)
         return {
             "url": f"{GEMINI_API_BASE_URL}/models/{model_name}:embedContent",
             "header_mode": "gemini",
@@ -107,7 +109,8 @@ def _embedding_request(
         }
     if provider_name in {"custom", "openai_compatible"}:
         endpoint = _require_url(base_url, "OpenAI-compatible base URL")
-        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_OPENAI_EMBEDDING_MODEL", DEFAULT_OPENAI_EMBEDDING_MODEL)
+        default_model = provider_config("openai_compatible").default_embedding_model or ""
+        model_name = selected_model or os.environ.get("SURVEY_INSIGHT_OPENAI_EMBEDDING_MODEL", default_model)
         return {
             "url": f"{endpoint}/embeddings",
             "header_mode": "bearer",
@@ -153,6 +156,8 @@ def _embed_gemini_batches(texts: list[str], api_key: str, request: dict[str, obj
 
 
 def _post_embeddings(api_key: str, url: str, header_mode: str, payload: dict[str, object]) -> dict[str, object]:
+    if os.environ.get("SURVEY_INSIGHT_DISABLE_NETWORK", "").strip().casefold() in {"1", "true", "yes"}:
+        raise RuntimeError("External network calls are disabled.")
     headers = {"Content-Type": "application/json"}
     if header_mode == "azure":
         headers["api-key"] = api_key

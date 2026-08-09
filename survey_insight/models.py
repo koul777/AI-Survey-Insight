@@ -58,6 +58,7 @@ class TextDocument:
     metadata: dict[str, Any]
     is_no_opinion: bool = False
     pii_found: list[str] = field(default_factory=list)
+    privacy_review_flags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -144,7 +145,7 @@ class AnalysisPackage:
     cross_analysis: list[dict[str, Any]]
     user_edits: list[UserEdit] = field(default_factory=list)
     methodology_note: str = (
-        "분석 결과는 자유응답 기반 주제 탐색이며, 최종 해석은 담당자의 검토를 거쳤다."
+        "분석 결과는 자유응답 기반 탐색 후보이며, 최종 해석과 배포 전 개인정보는 담당자가 검토해야 합니다."
     )
     created_at: str = field(default_factory=utc_now)
 

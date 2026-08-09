@@ -46,7 +46,14 @@ if (Test-PortInUse -Port $port) {
 }
 
 $url = "http://127.0.0.1:${port}"
+$storagePath = if ($env:SURVEY_INSIGHT_DB_PATH) {
+    $env:SURVEY_INSIGHT_DB_PATH
+} else {
+    Join-Path -Path $PSScriptRoot -ChildPath "out\app.db"
+}
 Write-Host "Starting AI Survey Insight: $url"
+Write-Host "Local data storage: $storagePath"
+Write-Host "Uploaded source data and analysis results may be stored there. Use the UI delete controls when no longer needed."
 Write-Host "Press Ctrl+C in this window to stop the server."
 
 Start-Process $url

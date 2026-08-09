@@ -1,17 +1,30 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from survey_insight.cli import create_demo_workbook
-from survey_insight.llm_interpretation import enhance_with_user_llm
+from survey_insight.llm_interpretation import _post_chat_completion, enhance_with_user_llm
 from survey_insight.pipeline import analyze_file
 
 
 class LlmInterpretationTests(unittest.TestCase):
+    def test_network_disable_flag_blocks_real_chat_transport(self) -> None:
+        with patch.dict(os.environ, {"SURVEY_INSIGHT_DISABLE_NETWORK": "1"}), patch(
+            "survey_insight.llm_interpretation.urllib.request.urlopen"
+        ) as urlopen:
+            with self.assertRaises(RuntimeError):
+                _post_chat_completion(
+                    "secret",
+                    {"url": "https://example.invalid", "header_mode": "bearer"},
+                    {"messages": []},
+                )
+        urlopen.assert_not_called()
+
     def _package(self):
         with tempfile.TemporaryDirectory() as tmp:
             workbook_path = Path(tmp) / "demo.xlsx"
@@ -65,7 +78,8 @@ class LlmInterpretationTests(unittest.TestCase):
         self.assertEqual(topic.sentiment_score, -0.68)
         self.assertEqual(topic.sentiment_method, "openai_llm_evidence")
         self.assertEqual(topic.urgency_score, 0.72)
-        self.assertIn("불만", topic.sentiment_evidence)
+        self.assertIn("기준", topic.sentiment_evidence)
+        self.assertNotIn("불만", topic.sentiment_evidence)
 
     def test_gemini_interpretation_uses_generate_content_response_shape(self) -> None:
         package = self._package()
@@ -151,6 +165,64 @@ class LlmInterpretationTests(unittest.TestCase):
         self.assertEqual(topic.sentiment_method, before_method)
         self.assertEqual(topic.urgency_score, before_urgency)
         self.assertEqual(topic.sentiment_evidence, before_evidence)
+
+    def test_ungrounded_or_out_of_range_llm_sentiment_cannot_overwrite_local_signal(self) -> None:
+        package = self._package()
+        topic = package.selected_topics[0]
+        before = (
+            topic.sentiment_label,
+            topic.sentiment_score,
+            topic.urgency_score,
+            list(topic.sentiment_evidence),
+            topic.sentiment_method,
+        )
+        fake_content = {
+            "topics": [
+                {
+                    "topic_id": topic.topic_id,
+                    "sentiment_label": "negative",
+                    "sentiment_score": -9,
+                    "urgency_score": 9,
+                    "sentiment_evidence": ["원문에 없는 허구 근거"],
+                }
+            ]
+        }
+        fake_response = {"output_text": json.dumps(fake_content, ensure_ascii=False)}
+
+        with patch("survey_insight.llm_interpretation._post_chat_completion", return_value=fake_response):
+            warnings = enhance_with_user_llm(
+                package,
+                "openai",
+                "sk-proj-live-shaped-key-abcdef1234567890abcdef1234567890",
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(
+            (
+                topic.sentiment_label,
+                topic.sentiment_score,
+                topic.urgency_score,
+                topic.sentiment_evidence,
+                topic.sentiment_method,
+            ),
+            before,
+        )
+
+    def test_provider_failure_keeps_local_interpretation_and_hides_credentials(self) -> None:
+        package = self._package()
+        secret = "sk-live-secret-value-abcdef1234567890"
+        before = package.recommendation.plain_language_summary
+        with patch(
+            "survey_insight.llm_interpretation._post_chat_completion",
+            side_effect=RuntimeError(f"response body and key {secret}"),
+        ):
+            warnings = enhance_with_user_llm(package, "openai", secret)
+
+        self.assertEqual(package.recommendation.plain_language_summary, before)
+        warning = " ".join(warnings)
+        self.assertIn("로컬 해석", warning)
+        self.assertNotIn(secret, warning)
+        self.assertNotIn("response body", warning)
 
 
 if __name__ == "__main__":

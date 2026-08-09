@@ -3,12 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .models import AnalysisPackage, Topic, UserEdit
+from .models import AnalysisPackage, Topic, UserEdit, utc_now
 
 
 def apply_edit(package: AnalysisPackage, edit_type: str, payload: dict[str, Any], user_id: str = "system") -> UserEdit:
     before = _snapshot(package)
-    if edit_type == "rename_topic":
+    if edit_type == "record_review":
+        _record_review(package, payload, user_id)
+    elif edit_type == "rename_topic":
         _rename_topic(package, payload["topic_id"], payload["label"], payload.get("summary"))
     elif edit_type == "replace_representative":
         _replace_representative(package, payload["topic_id"], payload["response"])
@@ -18,6 +20,8 @@ def apply_edit(package: AnalysisPackage, edit_type: str, payload: dict[str, Any]
         _merge_topics(package, payload["source_topic_ids"], payload["target_label"])
     else:
         raise ValueError(f"Unsupported edit_type: {edit_type}")
+    if edit_type != "record_review":
+        _mark_review_pending(package)
     _sync_selected_candidate(package)
     after = _snapshot(package)
     edit = UserEdit(edit_type=edit_type, before=before, after=after, user_id=user_id)
@@ -92,8 +96,41 @@ def _find_topic(topics: list[Topic], topic_id: str) -> Topic:
     raise ValueError(f"Topic not found: {topic_id}")
 
 
+def _record_review(package: AnalysisPackage, payload: dict[str, Any], user_id: str) -> None:
+    decision = str(payload.get("decision", "")).strip().casefold()
+    if decision not in {"approved", "changes_requested"}:
+        raise ValueError("record_review decision must be approved or changes_requested")
+    reviewer = str(user_id or "").strip()
+    if not reviewer or reviewer == "system":
+        raise ValueError("record_review requires an identified reviewer")
+    notes = str(payload.get("notes", "") or "").strip()
+    if len(notes) > 2000:
+        raise ValueError("record_review notes must be 2000 characters or fewer")
+    package.project["human_review"] = {
+        "status": decision,
+        "reviewer": reviewer,
+        "notes": notes,
+        "reviewed_at": utc_now(),
+        "selected_candidate_id": package.selected_candidate_id,
+        "topic_count": len(package.selected_topics),
+        "edit_count_at_review": len(package.user_edits),
+    }
+
+
+def _mark_review_pending(package: AnalysisPackage) -> None:
+    review = package.project.get("human_review")
+    if not isinstance(review, dict) or review.get("status") != "approved":
+        return
+    package.project["human_review"] = {
+        **review,
+        "status": "changes_pending_review",
+        "invalidated_reason": "analysis_changed_after_approval",
+    }
+
+
 def _snapshot(package: AnalysisPackage) -> dict[str, Any]:
     return {
+        "human_review": deepcopy(package.project.get("human_review", {"status": "not_reviewed"})),
         "topics": [
             {
                 "topic_id": topic.topic_id,
