@@ -23,6 +23,7 @@ def analyze_file(
     embedding_base_url: str | None = None,
     embedding_model: str | None = None,
     azure_api_version: str | None = None,
+    seed: int = 42,
 ) -> AnalysisPackage:
     table = load_table(path, sheet_name=sheet_name)
     return analyze_table(
@@ -35,6 +36,7 @@ def analyze_file(
         embedding_base_url=embedding_base_url,
         embedding_model=embedding_model,
         azure_api_version=azure_api_version,
+        seed=seed,
     )
 
 
@@ -50,6 +52,7 @@ def analyze_file_bytes(
     embedding_base_url: str | None = None,
     embedding_model: str | None = None,
     azure_api_version: str | None = None,
+    seed: int = 42,
 ) -> AnalysisPackage:
     table = load_table_bytes(data, filename, sheet_name=sheet_name)
     return analyze_table(
@@ -62,6 +65,7 @@ def analyze_file_bytes(
         embedding_base_url=embedding_base_url,
         embedding_model=embedding_model,
         azure_api_version=azure_api_version,
+        seed=seed,
     )
 
 
@@ -76,6 +80,7 @@ def analyze_table(
     embedding_base_url: str | None = None,
     embedding_model: str | None = None,
     azure_api_version: str | None = None,
+    seed: int = 42,
 ) -> AnalysisPackage:
     dataset_profile = profile_table(table, dataset_id=dataset_id)
     selected_text_column = text_column or _default_text_column(dataset_profile)
@@ -83,6 +88,7 @@ def analyze_table(
     documents = preprocess_documents(table.rows, selected_text_column, metadata_columns=selected_group_columns)
     recommendation = recommend_topics(
         documents,
+        seed=seed,
         embedding_provider=embedding_provider,
         embedding_api_key=embedding_api_key,
         embedding_base_url=embedding_base_url,
@@ -91,8 +97,13 @@ def analyze_table(
     )
     selected = recommendation.recommended
     cross = build_cross_analysis(valid_documents(documents), selected.assignments, selected.topics, selected_group_columns)
+    privacy_review_flag_count = sum(bool(document.privacy_review_flags) for document in documents)
     return AnalysisPackage(
-        project={"name": project_name},
+        project={
+            "name": project_name,
+            "analysis_seed": seed,
+            "privacy_review_flag_count": privacy_review_flag_count,
+        },
         dataset_profile=dataset_profile,
         text_column=selected_text_column,
         group_columns=selected_group_columns,

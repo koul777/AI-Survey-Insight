@@ -43,6 +43,22 @@ class SentimentTests(unittest.TestCase):
         self.assertEqual(result.urgency_score, 0.0)
         self.assertEqual(result.evidence_terms, ())
 
+    def test_simple_korean_negation_suppresses_false_polarity(self) -> None:
+        positive_negated = analyze_text_sentiment("현재 교육에는 만족하지 않습니다.")
+        negative_negated = analyze_text_sentiment("신청 절차가 더 이상 불편하지 않습니다.")
+
+        self.assertEqual(positive_negated.polarity_label, "neutral")
+        self.assertNotIn("만족", positive_negated.evidence_terms)
+        self.assertEqual(negative_negated.polarity_label, "neutral")
+        self.assertNotIn("불편", negative_negated.evidence_terms)
+
+    def test_bulmanjok_does_not_double_count_positive_satisfaction(self) -> None:
+        result = analyze_text_sentiment("평가 결과에 불만족합니다.")
+
+        self.assertEqual(result.polarity_label, "negative")
+        self.assertIn("불만", result.evidence_terms)
+        self.assertNotIn("만족", result.evidence_terms)
+
     def test_urgency_uses_complaint_and_urgency_terms(self) -> None:
         result = analyze_text_sentiment("갑작스러운 일정 변경이 늦게 공유되어 시급한 개선이 필요합니다.")
 

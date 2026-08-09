@@ -15,6 +15,38 @@ from pptx.util import Inches, Pt
 from .models import AnalysisPackage
 
 
+METRIC_LABELS = {
+    "stability": "군집 품질 종합점수(휴리스틱)",
+    "coherence": "토픽 해석 가능성 점수(UMass 방식)",
+    "semantic_quality": "군집 분리도(cosine silhouette)",
+    "coverage": "분석 포함률",
+    "diversity": "토픽 키워드 다양성",
+    "labelability": "라벨 해석 가능성",
+    "balance": "토픽 크기 균형",
+    "resampling_stability": "부분표본 일치도(진단)",
+    "resampling_stability_p10": "부분표본 일치도 10백분위(진단)",
+    "resampling_stability_p90": "부분표본 일치도 90백분위(진단)",
+    "weight_acceptability": "가중치 시나리오 선정률(민감도)",
+    "weight_acceptability_mcse": "가중치 시나리오 선정률 Monte Carlo 표준오차",
+    "weight_score_p10": "가중치 시나리오 점수 10백분위",
+    "weight_score_p90": "가중치 시나리오 점수 90백분위",
+    "bootstrap_gate_pass_rate": "Bootstrap 구조 관문 통과율",
+    "bootstrap_coverage_p025": "Bootstrap 분석 포함률 2.5백분위",
+    "bootstrap_coverage_p975": "Bootstrap 분석 포함률 97.5백분위",
+    "bootstrap_balance_p025": "Bootstrap 토픽 크기 균형 2.5백분위",
+    "bootstrap_min_topic_share_p025": "Bootstrap 최소 토픽 비율 2.5백분위",
+    "penalty": "품질 감점",
+}
+
+METHODOLOGY_SUMMARY = (
+    "권장 토픽 수는 군집 분리도, 키워드 동시출현 기반 해석 가능성, 분석 포함률, "
+    "키워드 다양성, 라벨 해석 가능성, 토픽 크기 균형을 결합한 휴리스틱으로 선정했습니다. "
+    "가중치를 명시된 범위에서 바꾼 512개 시나리오의 선정률과 500회 assignment-conditional bootstrap을 "
+    "별도 진단하고, 선정 후보는 5회 80% 층화 부분표본으로 다시 적합합니다. "
+    "통계적으로 검증된 최적값이나 정확도가 아니므로 대표 응답과 함께 담당자가 검토해야 합니다."
+)
+
+
 def export_excel(package: AnalysisPackage, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +97,7 @@ def export_powerpoint(package: AnalysisPackage, path: str | Path) -> Path:
 def _write_assigned_rows(ws: Any, package: AnalysisPackage) -> None:
     assignment_by_doc = {assignment.document_id: assignment.topic_id for assignment in package.assignments}
     topic_label = {topic.topic_id: topic.label for topic in package.selected_topics}
-    headers = ["row_index", "redacted_text", "topic_id", "topic_label"] + package.group_columns
+    headers = ["row_index", "redacted_text", "privacy_review_flags", "topic_id", "topic_label"] + package.group_columns
     ws.append(headers)
     for doc in package.documents:
         topic_id = assignment_by_doc.get(doc.id, "")
@@ -73,6 +105,7 @@ def _write_assigned_rows(ws: Any, package: AnalysisPackage) -> None:
             [
                 doc.row_index,
                 doc.redacted_text,
+                ", ".join(doc.privacy_review_flags),
                 topic_id,
                 topic_label.get(topic_id, ""),
                 *[doc.metadata.get(column) for column in package.group_columns],
@@ -147,7 +180,32 @@ def _write_model_settings(ws: Any, package: AnalysisPackage) -> None:
     ws.append(["allowed_topic_range", f"{rec.allowed_topic_range[0]}-{rec.allowed_topic_range[1]}"])
     ws.append(["minimum_topic_size", rec.minimum_topic_size])
     ws.append(["recommended_topic_count", rec.recommended.topic_count])
-    ws.append(["recommended_score", rec.recommended.score])
+    ws.append(["recommended_score (복합 평가값·휴리스틱)", rec.recommended.score])
+    ws.append(["analysis_seed", package.project.get("analysis_seed", 42)])
+    ws.append(["engine", rec.recommended.params.get("engine")])
+    ws.append(["feature_space", rec.recommended.params.get("feature_space")])
+    ws.append(["metric_profile", rec.recommended.params.get("metric_profile")])
+    ws.append(["quality_gate_passed", rec.recommended.params.get("quality_gate_passed")])
+    ws.append(["weight_sensitivity_profile", rec.recommended.params.get("weight_sensitivity_profile")])
+    ws.append(["weight_sensitivity_scenarios", rec.recommended.params.get("weight_sensitivity_scenarios")])
+    ws.append(["weight_multiplier_range", str(rec.recommended.params.get("weight_multiplier_range"))])
+    ws.append(["bootstrap_profile", rec.recommended.params.get("bootstrap_profile")])
+    ws.append(["bootstrap_repeats", rec.recommended.params.get("bootstrap_repeats")])
+    ws.append(["resampling_repeats", rec.recommended.params.get("resampling_repeats")])
+    review = _human_review(package)
+    ws.append(["human_review.status", review.get("status")])
+    ws.append(["human_review.reviewer", review.get("reviewer", "")])
+    ws.append(["human_review.reviewed_at", review.get("reviewed_at", "")])
+    ws.append(["privacy_review_flag_count", package.project.get("privacy_review_flag_count", 0)])
+    for key, value in rec.recommended.metrics.items():
+        ws.append([f"metric.{key} ({METRIC_LABELS.get(key, key)})", value])
+    for interval in rec.recommended.params.get("bootstrap_topic_share_intervals", []):
+        ws.append(
+            [
+                f"bootstrap.topic_share.{interval.get('topic_id')}",
+                f"estimate={interval.get('estimate')}, p025={interval.get('p025')}, p975={interval.get('p975')}",
+            ]
+        )
     ws.append(["text_column", package.text_column])
     ws.append(["methodology_note", package.methodology_note])
     for label, value in _recommendation_explanations(rec):
@@ -192,8 +250,9 @@ def _ppt_summary_slide(prs: Presentation, package: AnalysisPackage) -> None:
     rec = package.recommendation.recommended
     lines = [
         f"총 응답 {package.dataset_profile.row_count}건 중 유효 자유응답 {package.recommendation.valid_response_count}건을 분석했습니다.",
-        f"권장 토픽 수는 {rec.topic_count}개이며 종합 점수는 {rec.score:.2f}입니다.",
+        f"권장 토픽 수는 {rec.topic_count}개이며 복합 평가값(휴리스틱)은 {rec.score:.2f}입니다.",
         f"분석 컬럼: {package.text_column}",
+        f"사람 검토 상태: {_human_review(package).get('status', 'not_reviewed')}",
     ]
     lines.extend(f"{label}: {value}" for label, value in _recommendation_explanations(package.recommendation))
     lines.extend(package.recommendation.warnings[:2])
@@ -205,7 +264,7 @@ def _ppt_topics_slide(prs: Presentation, package: AnalysisPackage) -> None:
     slide = _ppt_blank_slide(prs, "주요 토픽")
     rows = min(len(package.selected_topics), 6) + 1
     table = slide.shapes.add_table(rows, 6, Inches(0.25), Inches(1.25), Inches(9.5), Inches(4.4)).table
-    headers = ["토픽", "응답 수", "비율", "감정/처리 우선도", "쉽게 읽는 해석", "대응 방안"]
+    headers = ["토픽", "응답 수", "비율", "감정 신호/처리 우선도", "쉽게 읽는 해석", "대응 방안"]
     for idx, header in enumerate(headers):
         table.cell(0, idx).text = header
         _ppt_cell_header(table.cell(0, idx))
@@ -238,9 +297,14 @@ def _ppt_methodology_slide(prs: Presentation, package: AnalysisPackage) -> None:
     slide = _ppt_blank_slide(prs, "방법론과 주의사항")
     rec = package.recommendation.recommended
     lines = [
-        "토픽 수는 후보 모델의 안정성, 응집도, 분리도, 커버리지, 다양성, 라벨 가능성을 종합해 추천했습니다.",
+        METHODOLOGY_SUMMARY,
         f"사용 엔진: {rec.params.get('engine', 'unknown')}",
         f"허용 토픽 범위: {package.recommendation.allowed_topic_range[0]}-{package.recommendation.allowed_topic_range[1]}개",
+        "표시 지표: 군집 품질 종합점수, 토픽 해석 가능성 점수, 군집 분리도, 분석 포함률, 토픽 키워드 다양성, 라벨 해석 가능성",
+        "가중치 시나리오 선정률은 512개 제한 범위 가중치 조합에서 같은 후보가 선택된 비율이며 정확도 확률이 아닙니다.",
+        "Bootstrap 구조 관문 통과율은 현재 배정에 조건부인 500회 진단이며 모집단 타당성이나 검정력이 아닙니다.",
+        "부분표본 일치도는 선정 후보의 5회 재적합 사후 진단이며 권장 점수에는 포함되지 않습니다.",
+        "감정은 규칙·어휘 기반 신호이며 처리 우선도는 긴급성 판정이 아닙니다.",
         package.methodology_note,
     ]
     _ppt_bullets(slide, lines, left=0.65, top=1.2, width=9.0, height=4.5)
@@ -293,6 +357,7 @@ def _document_xml(package: AnalysisPackage) -> str:
     body.append(_p(project_name, style="Title"))
     body.append(_p("AI 설문 자유응답 토픽모델링 분석 보고서", style="Subtitle"))
     body.append(_p(package.methodology_note))
+    body.append(_p(f"사람 검토 상태: {_human_review(package).get('status', 'not_reviewed')}"))
     for warning in package.recommendation.warnings:
         body.append(_p(f"주의: {warning}", style="Warning"))
     body.append(_heading("Executive Summary", 1))
@@ -300,18 +365,20 @@ def _document_xml(package: AnalysisPackage) -> str:
         _p(
             f"총 {package.dataset_profile.row_count}개 응답 중 "
             f"{package.recommendation.valid_response_count}개의 유효 자유응답을 분석했습니다. "
-            f"제품 추천 토픽 수는 {package.recommendation.recommended.topic_count}개입니다."
+            f"권장 토픽 수는 {package.recommendation.recommended.topic_count}개입니다."
         )
     )
     for label, value in _recommendation_explanations(package.recommendation):
         body.append(_heading(label, 2))
         body.append(_p(value))
-    body.append(_heading("추천 근거", 1))
+    body.append(_heading("권장 근거", 1))
     rec = package.recommendation.recommended
-    metric_rows = [["지표", "점수"]] + [[key, value] for key, value in rec.metrics.items()]
+    metric_rows = [["표시 지표", "내부 필드", "점수"]] + [
+        [METRIC_LABELS.get(key, key), key, value] for key, value in rec.metrics.items()
+    ]
     body.append(_table(metric_rows))
     body.append(_heading("주요 토픽", 1))
-    topic_rows = [["토픽", "응답 수", "비율", "감정", "처리 우선도", "감정 방식", "키워드", "요약", "쉽게 읽는 해석", "대응 방안", "감정 해석"]]
+    topic_rows = [["토픽", "응답 수", "비율", "감정 신호", "처리 우선도", "감정 방식", "키워드", "요약", "쉽게 읽는 해석", "대응 방안", "감정 해석"]]
     for topic in package.selected_topics:
         topic_rows.append(
             [
@@ -353,7 +420,7 @@ def _document_xml(package: AnalysisPackage) -> str:
     body.append(_heading("방법론 부록", 1))
     body.append(_p(f"분석 컬럼: {package.text_column}"))
     body.append(_p(f"분석 모드: {package.recommendation.mode}"))
-    body.append(_p("토픽 수는 후보 모델의 안정성, 응집도, 분리도, 커버리지, 다양성, 라벨 가능성을 종합해 추천했습니다."))
+    body.append(_p(METHODOLOGY_SUMMARY))
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
@@ -373,6 +440,13 @@ def _optional_text(obj: Any, field_name: str) -> str:
     return str(value)
 
 
+def _human_review(package: AnalysisPackage) -> dict[str, Any]:
+    review = package.project.get("human_review")
+    if isinstance(review, dict):
+        return review
+    return {"status": "not_reviewed"}
+
+
 def _recommendation_explanations(rec: Any) -> list[tuple[str, str]]:
     recommended = getattr(rec, "recommended", None)
     entries = [
@@ -382,7 +456,7 @@ def _recommendation_explanations(rec: Any) -> list[tuple[str, str]]:
             or _first_optional_text(recommended, ["plain_language_summary", "summary_plain_language"]),
         ),
         (
-            "왜 이 토픽 수를 추천했나요?",
+            "왜 이 토픽 수를 권장했나요?",
             _first_optional_text(rec, ["topic_count_explanation", "recommendation_reason", "topic_count_reason", "why_recommended"])
             or _first_optional_text(recommended, ["recommendation_reason", "topic_count_reason", "why_recommended"]),
         ),

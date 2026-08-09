@@ -5,6 +5,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
+from .evaluation import evaluate_sentiment_csv
 from .exports import export_excel, export_powerpoint, export_word
 from .pipeline import analyze_file, write_analysis_package
 
@@ -14,15 +15,24 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command")
     demo = sub.add_parser("demo", help="Create a PRD-like fixture and export reports")
     demo.add_argument("--out", default="out", help="Output directory")
+    demo.add_argument("--seed", type=int, default=42, help="Random seed for reproducible local models")
     analyze = sub.add_parser("analyze", help="Analyze an existing XLSX/CSV file")
     analyze.add_argument("--input", required=True)
     analyze.add_argument("--out", default="out")
     analyze.add_argument("--project-name", default="Survey Insight Project")
     analyze.add_argument("--text-column")
     analyze.add_argument("--group-column", action="append", default=[])
+    analyze.add_argument("--seed", type=int, default=42, help="Random seed for reproducible local models")
+    evaluate = sub.add_parser("evaluate-sentiment", help="Evaluate local sentiment with a labeled CSV")
+    evaluate.add_argument("--input", required=True, help="UTF-8 CSV containing text and gold labels")
+    evaluate.add_argument("--text-column", required=True)
+    evaluate.add_argument("--label-column", required=True)
+    evaluate.add_argument("--out", required=True, help="Aggregate JSON report path; raw text is omitted")
     args = parser.parse_args()
     if args.command == "analyze":
         _analyze(args)
+    elif args.command == "evaluate-sentiment":
+        _evaluate_sentiment(args)
     else:
         _demo(args)
 
@@ -32,7 +42,7 @@ def _demo(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     workbook_path = out_dir / "demo_survey.xlsx"
     create_demo_workbook(workbook_path)
-    package = analyze_file(workbook_path, project_name="AI Survey Insight Demo")
+    package = analyze_file(workbook_path, project_name="AI Survey Insight Demo", seed=args.seed)
     _write_outputs(package, out_dir)
     print(f"Demo workbook: {workbook_path}")
     print(f"Analysis package: {out_dir / 'analysis_package.json'}")
@@ -49,12 +59,23 @@ def _analyze(args: argparse.Namespace) -> None:
         project_name=args.project_name,
         text_column=args.text_column,
         group_columns=args.group_column or None,
+        seed=args.seed,
     )
     _write_outputs(package, out_dir)
     print(f"Analysis package: {out_dir / 'analysis_package.json'}")
     print(f"Excel report: {out_dir / 'survey_insight_report.xlsx'}")
     print(f"Word report: {out_dir / 'survey_insight_report.docx'}")
     print(f"PowerPoint report: {out_dir / 'survey_insight_report.pptx'}")
+
+
+def _evaluate_sentiment(args: argparse.Namespace) -> None:
+    target = evaluate_sentiment_csv(
+        args.input,
+        args.out,
+        text_column=args.text_column,
+        label_column=args.label_column,
+    )
+    print(f"Sentiment evaluation report: {target}")
 
 
 def _write_outputs(package, out_dir: Path) -> None:

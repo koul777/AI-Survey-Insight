@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+
+from .provider_config import ui_chat_presets
+
 
 def app_html() -> str:
-    return r"""<!doctype html>
+    html = r"""<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
@@ -694,6 +698,26 @@ def app_html() -> str:
       font-size: 13px;
       line-height: 1.5;
     }
+    .history-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    button.danger {
+      background: #fff;
+      color: #b42318;
+      border-color: #f0b4ad;
+    }
+    .trust-note {
+      border: 1px solid #b8d6d1;
+      border-radius: 8px;
+      padding: 11px 12px;
+      background: #f1faf8;
+      color: #344054;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .trust-note strong { color: var(--accent-dark); }
     .reps {
       margin: 8px 0 0;
       padding-left: 18px;
@@ -731,7 +755,7 @@ def app_html() -> str:
         <div class="brand-mark">AI</div>
         <div>
           <h1>AI Survey Insight</h1>
-          <p class="subtitle">토픽모델링 · 감정분석 · 보고서 자동화</p>
+          <p class="subtitle">토픽모델링 · 감정 신호 · 보고서 자동화</p>
         </div>
       </div>
       <span id="apiState" class="pill">API 확인 중</span>
@@ -742,6 +766,9 @@ def app_html() -> str:
       <aside>
         <div class="panel-head"><h2>분석 입력</h2></div>
         <div class="panel-body stack">
+          <div class="trust-note">
+            <strong>로컬 기본 분석</strong>은 외부 AI로 텍스트를 보내지 않지만, 업로드 원본과 분석 결과는 기본적으로 로컬 <code>out/app.db</code>에 저장됩니다. 외부 AI를 선택하면 마스킹된 응답 또는 대표 의견이 provider로 전송될 수 있습니다. 결과와 처리 우선도는 자동 판정이 아니라 담당자 검토용 보조정보입니다.
+          </div>
           <div>
             <label for="projectName">프로젝트명</label>
             <input id="projectName" type="text" value="Survey Insight Project" />
@@ -761,7 +788,7 @@ def app_html() -> str:
             <select id="groupColumns" multiple disabled></select>
           </div>
           <div>
-            <label for="llmProvider">정밀 분석 Provider</label>
+            <label for="llmProvider">선택적 외부 AI 보강</label>
             <select id="llmProvider">
               <option value="">사용 안 함</option>
               <option value="gemini">Gemini</option>
@@ -772,6 +799,10 @@ def app_html() -> str:
             </select>
           </div>
           <div id="providerSettings" class="stack">
+            <div class="trust-note"><strong>외부 전송 안내</strong><br />아래 preset은 예시이며 현재 제공을 보장하지 않습니다. 직접 모델명을 입력할 수 있습니다. API 키는 요청 중에만 사용하고 저장하지 않으며, 호출 실패 시 로컬 분석으로 돌아갑니다.</div>
+            <div class="trust-note">
+              <label><input id="externalTransferConfirmed" type="checkbox" style="width:auto" /> 마스킹된 응답·대표 의견이 선택 provider로 전송될 수 있으며 조직의 위탁처리·국외 이전·보존 정책을 확인했습니다.</label>
+            </div>
             <div id="baseUrlField">
               <label for="llmBaseUrl">Endpoint / Base URL</label>
               <input id="llmBaseUrl" type="text" autocomplete="off" placeholder="Azure: https://리소스.openai.azure.com / 호환 서버: https://host/v1" />
@@ -805,12 +836,14 @@ def app_html() -> str:
             <button id="powerpointBtn" class="secondary" disabled>PowerPoint 생성</button>
           </div>
           <div id="downloadLinks" class="row"></div>
+          <button id="reviewBtn" class="secondary" disabled>담당자 검토 기록</button>
+          <div id="reviewStatus" class="status">분석 후 담당자 검토를 기록하세요.</div>
         </div>
       </aside>
       <section>
         <div class="tabs">
           <button class="tab active" data-tab="profile">컬럼 프로파일</button>
-          <button class="tab" data-tab="recommendation">토픽 추천</button>
+          <button class="tab" data-tab="recommendation">토픽 권장안</button>
           <button class="tab" data-tab="topics">분석 결과</button>
           <button class="tab" data-tab="history">분석 이력</button>
         </div>
@@ -834,6 +867,7 @@ def app_html() -> str:
             </div>
             <button id="historyRefreshBtn" class="secondary" type="button">새로고침</button>
           </div>
+          <div class="trust-note">분석 결과 삭제 시 해당 run과 생성된 export 파일을 정리합니다. 원본 삭제는 연결된 모든 run과 export도 함께 삭제합니다. 내려받아 복사한 파일은 자동으로 삭제되지 않습니다.</div>
           <div id="historyList" class="empty">최근 분석 이력을 확인 중입니다.</div>
         </div>
       </section>
@@ -844,25 +878,7 @@ def app_html() -> str:
     const $ = (id) => document.getElementById(id);
     const fmt = (value) => value === null || value === undefined || value === "" ? "-" : String(value);
     const pct = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
-    const MODEL_OPTIONS = {
-      openai: [
-        ["gpt-5.5", "GPT-5.5"],
-        ["gpt-5.4", "GPT-5.4"],
-        ["gpt-5.4-mini", "GPT-5.4 Mini"]
-      ],
-      gemini: [
-        ["gemini-3.5-flash", "Gemini 3.5 Flash"],
-        ["gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"],
-        ["gemini-3.1-flash", "Gemini 3.1 Flash"],
-        ["gemini-3.1-flash-lite", "Gemini 3.1 Flash-Lite"]
-      ],
-      claude: [
-        ["claude-sonnet-5", "Claude Sonnet 5"],
-        ["claude-opus-4-8", "Claude Opus 4.8"],
-        ["claude-sonnet-4-6", "Claude Sonnet 4.6"],
-        ["claude-haiku-4-5-20251001", "Claude Haiku 4.5"]
-      ]
-    };
+    const MODEL_OPTIONS = __MODEL_OPTIONS__;
 
     document.querySelectorAll(".tab").forEach((button) => {
       button.addEventListener("click", () => {
@@ -875,6 +891,7 @@ def app_html() -> str:
     $("excelBtn").addEventListener("click", () => createExport("excel"));
     $("wordBtn").addEventListener("click", () => createExport("word"));
     $("powerpointBtn").addEventListener("click", () => createExport("powerpoint"));
+    $("reviewBtn").addEventListener("click", recordHumanReview);
     $("historyRefreshBtn").addEventListener("click", () => loadRecentProjects(true));
     $("llmProvider").addEventListener("change", updateProviderSettings);
     $("llmModelSelect").addEventListener("change", syncModelSelection);
@@ -943,6 +960,8 @@ def app_html() -> str:
         $("excelBtn").disabled = true;
         $("wordBtn").disabled = true;
         $("powerpointBtn").disabled = true;
+        $("reviewBtn").disabled = true;
+        setStatus("reviewStatus", "분석 후 담당자 검토를 기록하세요.", "");
         $("downloadLinks").innerHTML = "";
       } catch (err) {
         setStatus("uploadStatus", err.message, "error");
@@ -953,6 +972,10 @@ def app_html() -> str:
 
     async function runAnalysis() {
       if (!state.datasetId) return;
+      const selectedProvider = $("llmProvider").value;
+      if (selectedProvider && !$("externalTransferConfirmed").checked) {
+        return setStatus("runStatus", "외부 AI로 전송될 수 있는 데이터와 조직 정책을 확인한 뒤 체크해 주세요.", "error");
+      }
       setBusy("runBtn", true);
       setStatus("runStatus", "분석 중", "");
       try {
@@ -961,12 +984,13 @@ def app_html() -> str:
           project_name: $("projectName").value || "Survey Insight Project",
           text_column: $("textColumn").value || null,
           group_columns: Array.from($("groupColumns").selectedOptions).map((option) => option.value),
-          llm_provider: $("llmProvider").value || null,
+          llm_provider: selectedProvider || null,
           llm_api_key: $("llmApiKey").value || null,
           llm_base_url: $("llmBaseUrl").value || null,
           llm_model: selectedChatModel(),
           embedding_model: $("llmProvider").value === "claude" ? null : $("embeddingModel").value || null,
           azure_api_version: $("azureApiVersion").value || null,
+          external_transfer_confirmed: selectedProvider ? $("externalTransferConfirmed").checked : null,
         };
         $("llmApiKey").value = "";
         const res = await fetch("/model-runs", {
@@ -980,10 +1004,14 @@ def app_html() -> str:
         renderRecommendation(payload.recommendation);
         renderTopics(payload.recommendation.recommended.topics || []);
         activateTab("recommendation");
-        setStatus("runStatus", `분석 완료: ${payload.recommendation.mode}, N=${payload.recommendation.valid_response_count}`, "ok");
+        const privacyCount = Number(payload.privacy_review_flag_count || 0);
+        const privacyMessage = privacyCount ? ` · 개인정보 문맥 검토 필요 ${privacyCount}건` : "";
+        setStatus("runStatus", `분석 완료: ${payload.recommendation.mode}, N=${payload.recommendation.valid_response_count}${privacyMessage}`, "ok");
         $("excelBtn").disabled = false;
         $("wordBtn").disabled = false;
         $("powerpointBtn").disabled = false;
+        $("reviewBtn").disabled = false;
+        setStatus("reviewStatus", "아직 담당자 검토가 기록되지 않았습니다.", "");
       } catch (err) {
         setStatus("runStatus", err.message, "error");
       } finally {
@@ -1056,6 +1084,34 @@ def app_html() -> str:
       `;
     }
 
+    async function recordHumanReview() {
+      if (!state.runId) return;
+      const reviewer = window.prompt("검토자 이름 또는 내부 식별자를 입력하세요.", "");
+      if (!reviewer || !reviewer.trim()) return;
+      const notes = window.prompt("검토 메모를 입력하세요. 자동 라벨·대표 응답·개인정보를 확인했는지 기록하세요.", "") || "";
+      const confirmed = window.confirm("현재 권장 토픽 수, 라벨, 대표 응답과 개인정보 표시를 검토 완료로 기록할까요?");
+      if (!confirmed) return;
+      setBusy("reviewBtn", true);
+      try {
+        const res = await fetch(`/model-runs/${encodeURIComponent(state.runId)}/edits`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            edit_type: "record_review",
+            user_id: reviewer.trim(),
+            payload: { decision: "approved", notes }
+          })
+        });
+        const payload = await readJson(res);
+        const review = payload.human_review || {};
+        setStatus("reviewStatus", `검토 기록 완료: ${review.reviewer || reviewer.trim()}`, "ok");
+      } catch (err) {
+        setStatus("reviewStatus", `검토 기록 실패: ${err.message}`, "error");
+      } finally {
+        setBusy("reviewBtn", false);
+      }
+    }
+
     function activateTab(tabName) {
       document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item.dataset.tab === tabName));
       document.querySelectorAll(".tab-panel").forEach((item) => item.classList.toggle("active", item.id === tabName));
@@ -1064,6 +1120,7 @@ def app_html() -> str:
 
     function updateProviderSettings() {
       const provider = $("llmProvider").value;
+      $("externalTransferConfirmed").checked = false;
       $("providerSettings").style.display = provider ? "grid" : "none";
       $("baseUrlField").style.display = provider === "azure_openai" || provider === "custom" ? "block" : "none";
       $("azureVersionField").style.display = provider === "azure_openai" ? "block" : "none";
@@ -1122,7 +1179,7 @@ def app_html() -> str:
       $("recommendationSummary").innerHTML = [
         metric("모드", rec.mode),
         metric("유효 응답", rec.valid_response_count),
-        metric("권장 토픽", `${rec.recommended.topic_count}개`),
+        metric("권장 토픽 수", `${rec.recommended.topic_count}개`),
         metric("대안", `${wider} / ${detailed}`)
       ].join("");
       renderRecommendationExplanation(rec);
@@ -1131,11 +1188,13 @@ def app_html() -> str:
           <td>${candidate.rank}</td>
           <td>${candidate.topic_count}</td>
           <td>${candidate.score}</td>
-          <td>${candidate.params.engine}</td>
+          <td>${escapeHtml(candidate.params.engine)}</td>
+          <td>${candidate.params.quality_gate_passed === true ? "통과" : (candidate.params.quality_gate_passed === false ? `보류: ${escapeHtml((candidate.params.quality_gate_reasons || []).join(" · "))}` : "이전 결과")}</td>
           <td>${candidate.metrics.stability}</td>
           <td>${candidate.metrics.coherence}</td>
           <td>${candidate.metrics.semantic_quality}</td>
           <td>${candidate.metrics.coverage}</td>
+          <td>${candidate.metrics.weight_acceptability ?? "-"}</td>
         </tr>
       `).join("");
       const warnings = [...(rec.warnings || []), ...(rec.quality_warnings || [])]
@@ -1148,7 +1207,7 @@ def app_html() -> str:
           <div class="row">${warnings}</div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>순위</th><th>토픽 수</th><th>종합</th><th>엔진</th><th>안정성</th><th>응집도</th><th>분리도</th><th>커버리지</th></tr></thead>
+              <thead><tr><th>기본 점수 순위</th><th>토픽 수</th><th>복합 평가</th><th>엔진</th><th>구조 관문</th><th>군집 품질 종합점수</th><th>토픽 해석 가능성 점수</th><th>군집 분리도</th><th>분석 포함률</th><th>가중치 시나리오 선정률</th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           </div>
@@ -1193,19 +1252,25 @@ def app_html() -> str:
 
           <section class="dashboard-section">
             <p class="eyebrow">토픽 수를 정한 이유</p>
-            <h3>두 가지를 같이 봤습니다</h3>
+            <h3>구조 관문·복합 평가·가중치 민감도·재표본 진단을 함께 봤습니다</h3>
             <p>${escapeHtml(reason)}</p>
             <div class="score-grid">
-              ${scoreCard("안정성", metrics.stability, "다른 방식으로 나눠도 비슷한 묶음이 나오는지")}
-              ${scoreCard("응집도", metrics.coherence, "한 토픽 안의 키워드와 대표 응답이 서로 잘 맞는지")}
-              ${scoreCard("분리도", metrics.semantic_quality, "토픽끼리 충분히 다르게 보이는지")}
-              ${scoreCard("커버리지", metrics.coverage, "전체 응답을 얼마나 빠짐없이 설명하는지")}
+              ${scoreCard("군집 품질 종합점수", metrics.stability, "분리도·키워드 동시출현·크기 균형을 결합한 휴리스틱이며 통계적 안정성이 아닙니다")}
+              ${scoreCard("토픽 해석 가능성 점수", metrics.coherence, "상위 키워드가 같은 문서에서 함께 나타나는 정도를 이용한 UMass 방식의 휴리스틱")}
+              ${scoreCard("군집 분리도", metrics.semantic_quality, "노이즈 응답을 제외한 cosine silhouette의 음수를 0으로 제한한 값")}
+              ${scoreCard("분석 포함률", metrics.coverage, "노이즈로 제외되지 않고 토픽에 배정된 유효 응답 비율")}
+              ${scoreCard("토픽 키워드 다양성", metrics.diversity, "단어·구 포함 중복을 줄인 뒤 토픽별 상위 키워드가 서로 겹치지 않는 정도")}
+              ${scoreCard("라벨 해석 가능성", metrics.labelability, "키워드와 대표 응답이 라벨 검토에 충분한지 보는 휴리스틱")}
+              ${scoreCard("토픽 크기 균형", metrics.balance, "한 토픽의 과도한 지배 여부를 엔트로피 기반으로 점검한 값")}
+              ${metrics.weight_acceptability !== undefined ? scoreCard("가중치 시나리오 선정률", metrics.weight_acceptability, "기본 가중치를 각각 50~150% 범위에서 바꾸고 재정규화한 512개 시나리오 중 같은 후보가 선택된 비율입니다. 정확도 확률이 아닙니다") : ""}
+              ${metrics.bootstrap_gate_pass_rate !== undefined ? scoreCard("Bootstrap 구조 관문 통과율", metrics.bootstrap_gate_pass_rate, "현재 토픽 배정에 조건부로 응답을 500회 복원추출했을 때 최소 크기와 포함률 관문을 유지한 비율입니다. 통계적 검정력이 아닙니다") : ""}
+              ${metrics.resampling_stability !== undefined ? scoreCard("부분표본 일치도", metrics.resampling_stability, "선정 후보를 80% 층화 부분표본으로 5회 다시 적합한 ARI 평균이며 권장 점수에는 포함되지 않습니다") : ""}
             </div>
           </section>
 
           <section class="dashboard-section">
             <p class="eyebrow">우선 확인할 토픽</p>
-            <h3>전체 토픽을 처리 우선순위대로 정렬</h3>
+            <h3>전체 토픽을 처리 우선도 신호순으로 정렬</h3>
             <div class="priority-list">
               ${priorityTopics.length ? priorityTopics.map(priorityCard).join("") : `<div class="empty">표시할 토픽이 없습니다.</div>`}
             </div>
@@ -1213,7 +1278,7 @@ def app_html() -> str:
 
           <section class="dashboard-section">
             <p class="eyebrow">전체 토픽 표</p>
-            <h3>추천된 모든 토픽</h3>
+            <h3>권장안의 모든 토픽</h3>
             <p>위 카드와 같은 토픽을 표 형태로 다시 정리했습니다. 빠르게 비교할 때 사용하세요.</p>
             ${topicTable(topics)}
           </section>
@@ -1279,7 +1344,7 @@ def app_html() -> str:
       const urgencyWidth = Math.round(urgency * 100);
       const evidence = (topic.sentiment_evidence || []).slice(0, compact ? 4 : 6);
       const plain = topic.sentiment_plain_language || sentimentFallback(topic);
-      const scoreText = score > 0.05 ? `긍정 강도 ${score.toFixed(2)}` : score < -0.05 ? `부정 강도 ${score.toFixed(2)}` : `중립 ${score.toFixed(2)}`;
+      const scoreText = score > 0.05 ? `긍정 어휘 신호 ${score.toFixed(2)}` : score < -0.05 ? `부정 어휘 신호 ${score.toFixed(2)}` : `중립 신호 ${score.toFixed(2)}`;
       return `
         <div class="sentiment-detail">
           <div class="meta-line">
@@ -1289,7 +1354,7 @@ def app_html() -> str:
           <p>${escapeHtml(plain)}</p>
           <div class="sentiment-bars">
             <div class="sentiment-meter">
-              <span>감정 강도</span>
+              <span>어휘 극성 신호</span>
               <div class="sentiment-meter-track"><div class="sentiment-meter-fill ${tone}" style="width:${strength}%"></div></div>
               <span>${escapeHtml(scoreText)}</span>
             </div>
@@ -1338,7 +1403,7 @@ def app_html() -> str:
               <tr>
                 <th>분야</th>
                 <th>핵심어</th>
-                <th>감정 상세</th>
+                <th>감정 신호 상세</th>
                 <th>담당자용 설명</th>
                 <th>대표 의견</th>
               </tr>
@@ -1362,10 +1427,10 @@ def app_html() -> str:
 
     function sentimentMethodLabel(method) {
       const value = String(method || "").toLowerCase();
-      if (value.includes("openai")) return "OpenAI 근거 해석";
-      if (value.includes("gemini")) return "Gemini 근거 해석";
-      if (value.includes("claude")) return "Claude 근거 해석";
-      if (value.includes("rule")) return "로컬 규칙 보조";
+      if (value.includes("openai")) return "OpenAI 근거 보강";
+      if (value.includes("gemini")) return "Gemini 근거 보강";
+      if (value.includes("claude")) return "Claude 근거 보강";
+      if (value.includes("rule")) return "규칙·어휘 기반 신호";
       return value || "분석 방식 미상";
     }
 
@@ -1389,6 +1454,7 @@ def app_html() -> str:
         kmeans: "KMeans 군집",
         agglomerative: "계층 군집",
         nmf: "NMF 토픽모델",
+        nmf_kl: "KL-NMF 토픽모델",
         lda: "LDA 토픽모델",
         openai_embedding_kmeans: "OpenAI 의미 임베딩",
         openai_embedding_agglomerative: "OpenAI 의미 임베딩",
@@ -1448,6 +1514,7 @@ def app_html() -> str:
         const mode = firstValue(record, ["mode"], record.recommendation?.mode || null);
         const validCount = firstValue(record, ["valid_response_count"], record.recommendation?.valid_response_count || null);
         const topicCount = firstValue(record, ["topic_count", "recommended_topic_count"], record.recommendation?.recommended?.topic_count || null);
+        const reviewStatus = firstValue(record, ["human_review_status"], "not_reviewed");
         const runId = firstValue(record, ["run_id", "id"], null);
         const datasetName = firstValue(record, ["dataset_name", "source_name", "filename"], null);
         const summary = firstValue(record, ["summary", "description"], "");
@@ -1457,6 +1524,7 @@ def app_html() -> str:
           mode ? `모드 ${mode}` : null,
           validCount !== null ? `N=${validCount}` : null,
           topicCount !== null ? `토픽 ${topicCount}` : null,
+          `검토 ${reviewStatus}`,
           runId ? `Run ${runId}` : null
         ].filter(Boolean);
         return `
@@ -1464,9 +1532,66 @@ def app_html() -> str:
             <h3>${escapeHtml(title)}</h3>
             <div class="history-meta">${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
             ${summary ? `<p class="history-summary">${escapeHtml(summary)}</p>` : ""}
+            <div class="history-actions">
+              ${runId ? `<button class="secondary" type="button" data-delete-run="${escapeAttr(runId)}" data-delete-title="${escapeAttr(title)}">분석 결과 삭제</button>` : ""}
+              ${record.dataset_id ? `<button class="danger" type="button" data-delete-dataset="${escapeAttr(record.dataset_id)}" data-delete-title="${escapeAttr(title)}">원본·연결 분석 삭제</button>` : ""}
+            </div>
           </article>
         `;
       }).join("");
+      document.querySelectorAll("[data-delete-run]").forEach((button) => {
+        button.addEventListener("click", () => deleteRun(button.dataset.deleteRun, button.dataset.deleteTitle));
+      });
+      document.querySelectorAll("[data-delete-dataset]").forEach((button) => {
+        button.addEventListener("click", () => deleteDatasetWithRuns(button.dataset.deleteDataset, button.dataset.deleteTitle));
+      });
+    }
+
+    async function deleteRun(runId, title) {
+      if (!runId) return;
+      const confirmed = window.confirm(`'${title || "이 분석"}'의 분석 결과와 서버가 생성한 export 파일을 삭제할까요? 업로드 원본은 남습니다. 이 작업은 되돌릴 수 없습니다.`);
+      if (!confirmed) return;
+      try {
+        await readJson(await fetch(`/model-runs/${encodeURIComponent(runId)}`, { method: "DELETE" }));
+        if (state.runId === runId) clearCurrentRun();
+        state.historyLoaded = false;
+        await loadRecentProjects(true);
+        setStatus("historyStatus", "분석 결과와 연결된 export 파일을 삭제했습니다.", "ok");
+      } catch (err) {
+        setStatus("historyStatus", `삭제하지 못했습니다. ${err.message}`, "error");
+      }
+    }
+
+    async function deleteDatasetWithRuns(datasetId, title) {
+      if (!datasetId) return;
+      const confirmed = window.confirm(`'${title || "이 프로젝트"}'의 업로드 원본, 연결된 모든 분석 결과와 서버 export 파일을 함께 삭제할까요? 내려받은 파일은 삭제되지 않으며 이 작업은 되돌릴 수 없습니다.`);
+      if (!confirmed) return;
+      try {
+        await readJson(await fetch(`/datasets/${encodeURIComponent(datasetId)}?delete_runs=true`, { method: "DELETE" }));
+        if (state.datasetId === datasetId) {
+          state.datasetId = null;
+          state.profile = null;
+          clearCurrentRun();
+          $("runBtn").disabled = true;
+          setStatus("uploadStatus", "업로드 원본과 연결 분석을 삭제했습니다.", "ok");
+        }
+        state.historyLoaded = false;
+        await loadRecentProjects(true);
+        setStatus("historyStatus", "업로드 원본과 연결된 분석·export 파일을 삭제했습니다.", "ok");
+      } catch (err) {
+        setStatus("historyStatus", `삭제하지 못했습니다. ${err.message}`, "error");
+      }
+    }
+
+    function clearCurrentRun() {
+      state.runId = null;
+      state.recommendation = null;
+      $("excelBtn").disabled = true;
+      $("wordBtn").disabled = true;
+      $("powerpointBtn").disabled = true;
+      $("reviewBtn").disabled = true;
+      $("downloadLinks").innerHTML = "";
+      setStatus("reviewStatus", "분석 후 담당자 검토를 기록하세요.", "");
     }
 
     function setHistoryEmpty(message) {
@@ -1515,7 +1640,15 @@ def app_html() -> str:
       const text = await res.text();
       let payload = {};
       try { payload = text ? JSON.parse(text) : {}; } catch (_) {}
-      if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`);
+      if (!res.ok) {
+        const detail = typeof payload.detail === "object" ? payload.detail?.message : payload.detail;
+        const safeMessage = res.status === 404
+          ? "요청한 데이터를 찾을 수 없습니다."
+          : res.status === 409
+            ? (detail || "연결된 데이터가 있어 현재 요청을 완료할 수 없습니다.")
+            : "요청을 처리하지 못했습니다. 입력과 설정을 확인해 주세요.";
+        throw new Error(safeMessage);
+      }
       return payload;
     }
 
@@ -1540,3 +1673,4 @@ def app_html() -> str:
   </script>
 </body>
 </html>"""
+    return html.replace("__MODEL_OPTIONS__", json.dumps(ui_chat_presets(), ensure_ascii=False))

@@ -2,23 +2,150 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 from openpyxl import load_workbook
+from pptx import Presentation
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.feature_extraction.text import CountVectorizer
 
 from survey_insight.cli import create_demo_workbook
 from survey_insight.edits import apply_edit
 from survey_insight.embeddings import EmbeddingResult
 from survey_insight.exports import export_excel, export_powerpoint, export_word
+from survey_insight.models import CandidateSolution, TextDocument, Topic, TopicAssignment
 from survey_insight.pipeline import analyze_file
-from survey_insight.preprocessing import is_no_opinion, mask_pii, tokenize_keywords, tokenizer_source
-from survey_insight.topics import _silhouette
+from survey_insight.preprocessing import (
+    detect_privacy_review_flags,
+    is_no_opinion,
+    mask_pii,
+    tokenize_keywords,
+    tokenizer_source,
+)
+from survey_insight.topics import (
+    _attach_assignment_bootstrap,
+    _attach_weight_sensitivity,
+    _build_candidates,
+    _class_tfidf_scores,
+    _cluster,
+    _coherence,
+    _count_vectorize,
+    _fit_nmf,
+    _lda_input_diagnostics,
+    _select_distinct_keywords,
+    _silhouette,
+    _select_recommended,
+    topic_policy,
+)
 
 
 class PipelineTests(unittest.TestCase):
+    def test_distinct_keyword_selection_removes_word_ngram_containment(self) -> None:
+        features = np.asarray(["캠페인", "성과", "캠페인 성과", "교육", "지원", "문화", "보상"])
+        scores = np.asarray([0.9, 0.8, 1.0, 0.7, 0.6, 0.5, 0.4])
+
+        keywords = _select_distinct_keywords(features, scores, limit=5)
+
+        self.assertIn("캠페인 성과", keywords)
+        self.assertNotIn("캠페인", keywords)
+        self.assertNotIn("성과", keywords)
+        self.assertEqual(len(keywords), 5)
+
+    def test_class_tfidf_emphasizes_cluster_specific_terms(self) -> None:
+        texts = ["공통 사과 사과 사과", "공통 사과 사과", "공통 배 배 배", "공통 배 배"]
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=text,
+                redacted_text=text,
+                metadata={},
+            )
+            for index, text in enumerate(texts)
+        ]
+        vectorizer = CountVectorizer(token_pattern=r"(?u)\b\w+\b")
+        vectorizer.fit(texts)
+        labels = np.asarray([0, 0, 1, 1])
+
+        scores = _class_tfidf_scores(documents, labels, vectorizer)
+        vocabulary = vectorizer.vocabulary_
+
+        self.assertGreater(scores[0][vocabulary["사과"]], scores[0][vocabulary["공통"]])
+        self.assertGreater(scores[1][vocabulary["배"]], scores[1][vocabulary["공통"]])
+
+    def test_nmf_candidates_are_evaluated_when_kmeans_collapses(self) -> None:
+        texts = ["alpha apple", "alpha apricot", "beta banana", "beta berry"]
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=text,
+                redacted_text=text,
+                metadata={},
+            )
+            for index, text in enumerate(texts)
+        ]
+        vectorizer = CountVectorizer()
+        matrix = vectorizer.fit_transform(texts)
+        labels = np.asarray([0, 0, 1, 1])
+        weights = np.asarray([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
+        components = np.ones((2, matrix.shape[1]), dtype=float)
+
+        def fake_candidate(*args: object, **kwargs: object) -> CandidateSolution:
+            source = str(args[6])
+            return CandidateSolution(
+                candidate_id=source,
+                topic_count=2,
+                params={"engine": source, **dict(kwargs.get("extra_params", {}))},
+                metrics={},
+                score=0.0,
+            )
+
+        with (
+            patch("survey_insight.topics._cluster", return_value=None),
+            patch("survey_insight.topics._cluster_dbscan_candidates", return_value=[]),
+            patch("survey_insight.topics._cluster_agglomerative", return_value=None),
+            patch("survey_insight.topics._fit_nmf", return_value=(labels, weights, components)) as fit_nmf,
+            patch("survey_insight.topics._fit_lda", return_value=None),
+            patch("survey_insight.topics._candidate_from_labels", side_effect=fake_candidate),
+        ):
+            candidates = _build_candidates(
+                documents,
+                vectorizer,
+                matrix,
+                vectorizer,
+                matrix,
+                (2, 2),
+                min_topic_size=2,
+                seed=42,
+            )
+
+        engines = {candidate.params["engine"] for candidate in candidates}
+        self.assertEqual(engines, {"nmf", "nmf_kl"})
+        self.assertEqual(candidates[0].params["nmf_objective"], "frobenius")
+        self.assertEqual(candidates[1].params["nmf_objective"], "generalized_kullback_leibler")
+        self.assertEqual(fit_nmf.call_count, 2)
+
+    def test_nonconverged_nmf_candidate_is_rejected(self) -> None:
+        class NonConvergingNMF:
+            def __init__(self, **_: object) -> None:
+                self.components_ = np.ones((2, 3), dtype=float)
+
+            def fit_transform(self, matrix: np.ndarray) -> np.ndarray:
+                warnings.warn("iteration limit", ConvergenceWarning)
+                return np.asarray([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+
+        with patch("survey_insight.topics.NMF", NonConvergingNMF):
+            result = _fit_nmf(np.ones((4, 3), dtype=float), 2, 42)
+
+        self.assertIsNone(result)
+
     def test_prd_like_fixture_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -40,7 +167,33 @@ class PipelineTests(unittest.TestCase):
             engines = {candidate.params["engine"] for candidate in package.recommendation.candidates}
             self.assertIn("kmeans", engines)
             self.assertIn("nmf", engines)
+            self.assertIn("nmf_kl", engines)
             self.assertIn("lda", engines)
+            self.assertTrue(package.recommendation.recommended.params["quality_gate_passed"])
+            resampling_status = package.recommendation.recommended.params["resampling_status"]
+            self.assertIn(
+                resampling_status,
+                {"evaluated", "insufficient_successful_repeats", "unsupported_for_density_candidate"},
+            )
+            if resampling_status == "evaluated":
+                self.assertGreaterEqual(package.recommendation.recommended.metrics["resampling_stability"], 0.0)
+                self.assertLessEqual(package.recommendation.recommended.metrics["resampling_stability"], 1.0)
+                self.assertEqual(package.recommendation.recommended.params["resampling_repeats"], 5)
+            self.assertEqual(package.recommendation.recommended.params["weight_sensitivity_scenarios"], 512)
+            self.assertEqual(package.recommendation.recommended.params["bootstrap_repeats"], 500)
+            self.assertEqual(package.recommendation.recommended.params["bootstrap_status"], "evaluated")
+            self.assertGreaterEqual(package.recommendation.recommended.metrics["weight_acceptability"], 0.0)
+            self.assertLessEqual(package.recommendation.recommended.metrics["weight_acceptability"], 1.0)
+            self.assertGreaterEqual(package.recommendation.recommended.metrics["bootstrap_gate_pass_rate"], 0.0)
+            self.assertLessEqual(package.recommendation.recommended.metrics["bootstrap_gate_pass_rate"], 1.0)
+            self.assertTrue(package.recommendation.recommended.params["bootstrap_topic_share_intervals"])
+            lda_candidate = next(
+                candidate for candidate in package.recommendation.candidates if candidate.params["engine"] == "lda"
+            )
+            self.assertEqual(lda_candidate.params["feature_space"], "term_count")
+            self.assertEqual(lda_candidate.params["topic_terms"], "lda_components_distinct_ngrams")
+            self.assertTrue(all(topic.keywords for topic in lda_candidate.topics))
+            self.assertTrue(any(0.0 < assignment.probability < 1.0 for assignment in lda_candidate.assignments))
             self.assertTrue(package.recommendation.plain_language_summary)
             self.assertIn("유효 자유응답", package.recommendation.plain_language_summary)
             self.assertIn("함께 비교", package.recommendation.topic_count_explanation)
@@ -53,6 +206,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(package.selected_topics[0].sentiment_plain_language)
             package.documents[0].original_text = "연락처는 privacy@example.com 입니다."
             package.documents[0].redacted_text = "연락처는 [EMAIL] 입니다."
+            package.documents[0].privacy_review_flags = ["explicit_name_context"]
             excel_path = export_excel(package, tmp_path / "report.xlsx")
             word_path = export_word(package, tmp_path / "report.docx")
             ppt_path = export_powerpoint(package, tmp_path / "report.pptx")
@@ -65,13 +219,44 @@ class PipelineTests(unittest.TestCase):
             assigned_headers = [cell.value for cell in assigned_sheet[1]]
             self.assertNotIn("original_text", assigned_headers)
             self.assertIn("redacted_text", assigned_headers)
+            self.assertIn("privacy_review_flags", assigned_headers)
             assigned_values = " ".join(str(cell.value or "") for row in assigned_sheet.iter_rows() for cell in row)
             self.assertNotIn("privacy@example.com", assigned_values)
             self.assertIn("[EMAIL]", assigned_values)
+            self.assertIn("explicit_name_context", assigned_values)
+            model_settings = " ".join(
+                str(cell.value or "")
+                for row in workbook["모델설정"].iter_rows()
+                for cell in row
+            )
+            for term in ["군집 품질 종합점수", "토픽 해석 가능성 점수", "군집 분리도", "분석 포함률"]:
+                self.assertIn(term, model_settings)
+            self.assertIn("human_review.status", model_settings)
+            self.assertIn("부분표본 일치도", model_settings)
+            self.assertIn("가중치 시나리오 선정률", model_settings)
+            self.assertIn("Bootstrap 구조 관문 통과율", model_settings)
             with zipfile.ZipFile(word_path) as zf:
                 self.assertIn("word/document.xml", zf.namelist())
+                word_xml = zf.read("word/document.xml").decode("utf-8")
+            self.assertIn("권장 토픽 수", word_xml)
+            self.assertIn("군집 품질 종합점수", word_xml)
+            self.assertIn("가중치 시나리오 선정률", word_xml)
+            self.assertIn("Bootstrap 구조 관문 통과율", word_xml)
+            self.assertNotIn("제품 추천 토픽 수", word_xml)
             with zipfile.ZipFile(ppt_path) as zf:
                 self.assertIn("ppt/presentation.xml", zf.namelist())
+            presentation = Presentation(ppt_path)
+            ppt_text = "\n".join(
+                shape.text
+                for slide in presentation.slides
+                for shape in slide.shapes
+                if hasattr(shape, "text_frame")
+            )
+            self.assertIn("권장 토픽 수", ppt_text)
+            self.assertIn("군집 품질 종합점수", ppt_text)
+            self.assertIn("가중치 시나리오 선정률", ppt_text)
+            self.assertIn("Bootstrap 구조 관문 통과율", ppt_text)
+            self.assertIn("긴급성 판정이 아닙니다", ppt_text)
 
     def test_preprocessing_privacy_and_no_opinion(self) -> None:
         self.assertTrue(is_no_opinion("해당 없음"))
@@ -81,6 +266,16 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("email", found)
         self.assertIn("[PHONE]", masked)
         self.assertIn("[EMAIL]", masked)
+        employee_masked, employee_found = mask_pii("담당 사번 AB-20260001의 확인이 필요합니다.")
+        self.assertIn("employee_id", employee_found)
+        self.assertIn("[EMPLOYEE_ID]", employee_masked)
+        self.assertNotIn("AB-20260001", employee_masked)
+        ordinary_text = "사번 제도와 직번 관리 절차를 개선해 주세요."
+        self.assertEqual(mask_pii(ordinary_text), (ordinary_text, []))
+        self.assertEqual(
+            detect_privacy_review_flags("성명: 홍길동, 주소: 서울, 계좌번호를 적었습니다"),
+            ["explicit_name_context", "explicit_address_context", "financial_account_context"],
+        )
 
     def test_kiwi_noun_tokenizer_extracts_korean_nouns(self) -> None:
         self.assertEqual(tokenizer_source(), "kiwi_noun_extractor")
@@ -95,6 +290,240 @@ class PipelineTests(unittest.TestCase):
         matrix = np.asarray([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]])
         labels = np.asarray([0, 0, 0])
         self.assertEqual(_silhouette(matrix, labels), 0.0)
+
+    def test_lda_feature_matrix_uses_integer_term_counts(self) -> None:
+        _, matrix = _count_vectorize(
+            [
+                "평가 보상 기준 개선",
+                "평가 기준 설명 필요",
+                "교육 과정 신청 편의",
+                "교육 일정 안내 필요",
+            ]
+        )
+        self.assertTrue(np.all(np.equal(matrix.data, np.floor(matrix.data))))
+        self.assertGreater(matrix.sum(), 0)
+
+    def test_short_lda_input_is_flagged_as_insufficient_evidence(self) -> None:
+        _, matrix = _count_vectorize(["급여", "평가", "승진", "교육"])
+        diagnostics = _lda_input_diagnostics(matrix)
+        self.assertFalse(diagnostics["input_evidence_sufficient"])
+        self.assertEqual(diagnostics["input_short_response_share"], 1.0)
+
+    def test_collapsed_kmeans_candidate_is_rejected(self) -> None:
+        identical = np.ones((6, 3), dtype=float)
+        self.assertIsNone(_cluster(identical, 3, seed=42))
+
+    def test_silhouette_excludes_dbscan_outliers(self) -> None:
+        matrix = np.asarray(
+            [
+                [1.0, 0.0],
+                [0.95, 0.05],
+                [0.0, 1.0],
+                [0.05, 0.95],
+                [0.5, 0.5],
+            ]
+        )
+        labels = np.asarray([0, 0, 1, 1, -1])
+        self.assertGreater(_silhouette(matrix, labels), 0.8)
+
+    def test_topic_coherence_uses_document_cooccurrence(self) -> None:
+        vectorizer = CountVectorizer()
+        matrix = vectorizer.fit_transform(
+            [
+                "pay reward policy",
+                "pay reward review",
+                "pay reward fairness",
+                "training schedule course",
+                "training schedule registration",
+            ]
+        )
+        coherent = Topic("T01", "보상", "", 3, 0.6, ["pay", "reward"], ["pay reward policy"])
+        incoherent = Topic("T02", "혼합", "", 2, 0.4, ["pay", "training"], ["training schedule course"])
+        self.assertGreater(
+            _coherence(vectorizer, matrix, [coherent]),
+            _coherence(vectorizer, matrix, [incoherent]),
+        )
+
+    def test_small_sample_policy_is_explicit_and_bounded(self) -> None:
+        mode, topic_range, minimum_size, warnings = topic_policy(12)
+        self.assertEqual(mode, "초소표본 모드")
+        self.assertEqual(topic_range, (1, 3))
+        self.assertEqual(minimum_size, 2)
+        self.assertTrue(any("테마 코딩" in warning for warning in warnings))
+
+    def test_same_input_and_seed_produce_same_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workbook_path = Path(tmp) / "demo.xlsx"
+            create_demo_workbook(workbook_path)
+            first = analyze_file(workbook_path, seed=2026)
+            second = analyze_file(workbook_path, seed=2026)
+
+        first_signature = (
+            first.recommendation.recommended.params["engine"],
+            first.recommendation.recommended.topic_count,
+            first.recommendation.recommended.score,
+            first.recommendation.recommended.metrics["weight_acceptability"],
+            first.recommendation.recommended.metrics["bootstrap_gate_pass_rate"],
+            first.recommendation.recommended.params["bootstrap_topic_share_intervals"],
+            first.recommendation.recommended.params.get("resampling_scores", []),
+            [(topic.count, topic.keywords) for topic in first.selected_topics],
+        )
+        second_signature = (
+            second.recommendation.recommended.params["engine"],
+            second.recommendation.recommended.topic_count,
+            second.recommendation.recommended.score,
+            second.recommendation.recommended.metrics["weight_acceptability"],
+            second.recommendation.recommended.metrics["bootstrap_gate_pass_rate"],
+            second.recommendation.recommended.params["bootstrap_topic_share_intervals"],
+            second.recommendation.recommended.params.get("resampling_scores", []),
+            [(topic.count, topic.keywords) for topic in second.selected_topics],
+        )
+        self.assertEqual(first_signature, second_signature)
+
+    def test_weight_sensitivity_is_bounded_reproducible_and_guides_near_ties(self) -> None:
+        def make_candidates() -> list[CandidateSolution]:
+            return [
+                CandidateSolution(
+                    candidate_id="wide",
+                    topic_count=3,
+                    params={"quality_gate_passed": True},
+                    metrics={
+                        "semantic_quality": 0.76,
+                        "coherence": 0.62,
+                        "coverage": 0.99,
+                        "diversity": 0.70,
+                        "labelability": 0.90,
+                        "balance": 0.72,
+                        "penalty": 0.01,
+                    },
+                    score=0.74,
+                ),
+                CandidateSolution(
+                    candidate_id="detailed",
+                    topic_count=4,
+                    params={"quality_gate_passed": True},
+                    metrics={
+                        "semantic_quality": 0.66,
+                        "coherence": 0.82,
+                        "coverage": 0.98,
+                        "diversity": 0.88,
+                        "labelability": 0.92,
+                        "balance": 0.80,
+                        "penalty": 0.01,
+                    },
+                    score=0.73,
+                ),
+            ]
+
+        first = make_candidates()
+        second = make_candidates()
+        _attach_weight_sensitivity(first, seed=77, scenarios=200)
+        _attach_weight_sensitivity(second, seed=77, scenarios=200)
+
+        first_metrics = [candidate.metrics for candidate in first]
+        self.assertEqual(first_metrics, [candidate.metrics for candidate in second])
+        self.assertAlmostEqual(sum(candidate.metrics["weight_acceptability"] for candidate in first), 1.0, places=2)
+        for candidate in first:
+            self.assertGreaterEqual(candidate.metrics["weight_acceptability"], 0.0)
+            self.assertLessEqual(candidate.metrics["weight_acceptability"], 1.0)
+            self.assertGreaterEqual(candidate.metrics["weight_acceptability_mcse"], 0.0)
+            self.assertLessEqual(candidate.metrics["weight_acceptability_mcse"], 0.5 / np.sqrt(200))
+            self.assertLessEqual(candidate.metrics["weight_score_p10"], candidate.metrics["weight_score_p90"])
+
+        expected = max(first, key=lambda candidate: candidate.metrics["weight_acceptability"])
+        self.assertIs(_select_recommended(first), expected)
+
+    def test_assignment_bootstrap_reports_reproducible_structural_uncertainty(self) -> None:
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=f"응답 {index}",
+                redacted_text=f"응답 {index}",
+                metadata={},
+            )
+            for index in range(20)
+        ]
+
+        def make_candidate() -> CandidateSolution:
+            topics = [
+                Topic("T01", "주제 1", "", 10, 0.5, ["주제"], ["응답 0"]),
+                Topic("T02", "주제 2", "", 10, 0.5, ["개선"], ["응답 10"]),
+            ]
+            assignments = [
+                TopicAssignment(
+                    document_id=document.id,
+                    topic_id="T01" if index < 10 else "T02",
+                    probability=1.0,
+                    is_outlier=False,
+                    assignment_source="test",
+                )
+                for index, document in enumerate(documents)
+            ]
+            return CandidateSolution(
+                candidate_id="bootstrap",
+                topic_count=2,
+                params={"min_topic_size": 3},
+                metrics={},
+                score=0.8,
+                topics=topics,
+                assignments=assignments,
+            )
+
+        first = make_candidate()
+        second = make_candidate()
+        self.assertIsNone(_attach_assignment_bootstrap(first, documents, seed=91, repeats=200))
+        self.assertIsNone(_attach_assignment_bootstrap(second, documents, seed=91, repeats=200))
+        self.assertEqual(first.metrics, second.metrics)
+        self.assertEqual(
+            first.params["bootstrap_topic_share_intervals"],
+            second.params["bootstrap_topic_share_intervals"],
+        )
+        self.assertEqual(first.params["bootstrap_status"], "evaluated")
+        self.assertGreaterEqual(first.metrics["bootstrap_gate_pass_rate"], 0.0)
+        self.assertLessEqual(first.metrics["bootstrap_gate_pass_rate"], 1.0)
+        for interval in first.params["bootstrap_topic_share_intervals"]:
+            self.assertLessEqual(interval["p025"], interval["estimate"])
+            self.assertLessEqual(interval["estimate"], interval["p975"])
+
+    def test_assignment_bootstrap_warns_for_fragile_small_topics(self) -> None:
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=f"합성 응답 {index}",
+                redacted_text=f"합성 응답 {index}",
+                metadata={},
+            )
+            for index in range(36)
+        ]
+        topics = [
+            Topic("T01", "다수", "", 30, 30 / 36, ["다수"], ["합성 응답 0"]),
+            Topic("T02", "소수 A", "", 3, 3 / 36, ["소수"], ["합성 응답 30"]),
+            Topic("T03", "소수 B", "", 3, 3 / 36, ["소수"], ["합성 응답 33"]),
+        ]
+        assignments = []
+        for index, document in enumerate(documents):
+            topic_id = "T01" if index < 30 else ("T02" if index < 33 else "T03")
+            assignments.append(TopicAssignment(document.id, topic_id, 1.0, False, "test"))
+        candidate = CandidateSolution(
+            candidate_id="fragile",
+            topic_count=3,
+            params={"min_topic_size": 3},
+            metrics={},
+            score=0.7,
+            topics=topics,
+            assignments=assignments,
+        )
+
+        warning = _attach_assignment_bootstrap(candidate, documents, seed=42, repeats=500)
+
+        self.assertIsNotNone(warning)
+        self.assertLess(candidate.metrics["bootstrap_gate_pass_rate"], 0.80)
+        rare_intervals = candidate.params["bootstrap_topic_share_intervals"][1:]
+        self.assertTrue(any(interval["p025"] == 0.0 for interval in rare_intervals))
 
     def test_user_edit_is_recorded_and_export_state_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +540,21 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(edit.edit_type, "rename_topic")
             self.assertEqual(package.selected_topics[0].label, "평가와 보상")
             self.assertEqual(len(package.user_edits), 1)
+            approval = apply_edit(
+                package,
+                "record_review",
+                {"decision": "approved", "notes": "대표 응답과 개인정보 확인"},
+                user_id="reviewer-1",
+            )
+            self.assertEqual(approval.edit_type, "record_review")
+            self.assertEqual(package.project["human_review"]["status"], "approved")
+            apply_edit(
+                package,
+                "rename_topic",
+                {"topic_id": topic_id, "label": "평가·보상 검토", "summary": "재검토"},
+                user_id="tester",
+            )
+            self.assertEqual(package.project["human_review"]["status"], "changes_pending_review")
 
     def test_user_key_embedding_candidates_join_topic_count_competition(self) -> None:
         def fake_embeddings(texts: list[str], provider: str | None, api_key: str | None, **_: object) -> EmbeddingResult:

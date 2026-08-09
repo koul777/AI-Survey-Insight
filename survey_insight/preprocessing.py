@@ -52,7 +52,21 @@ _TOKENIZER_SOURCE = ""
 PII_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[EMAIL]"),
     ("phone", re.compile(r"\b(?:010|011|016|017|018|019)[-. ]?\d{3,4}[-. ]?\d{4}\b"), "[PHONE]"),
-    ("employee_id", re.compile(r"\b(?:사번|직번|employee\s*id)[:\s-]*[A-Za-z0-9-]{4,}\b", re.I), "[EMPLOYEE_ID]"),
+    (
+        "employee_id",
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:사번|직번|employee\s*id)[:#\s-]*[A-Za-z0-9][A-Za-z0-9-]{3,}(?![A-Za-z0-9-])",
+            re.I,
+        ),
+        "[EMPLOYEE_ID]",
+    ),
+]
+
+PRIVACY_REVIEW_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("explicit_name_context", re.compile(r"(?:이름|성명)\s*[:：]")),
+    ("explicit_address_context", re.compile(r"(?:주소|거주지)\s*[:：]")),
+    ("national_id_context", re.compile(r"(?:주민등록번호|주민번호)")),
+    ("financial_account_context", re.compile(r"(?:계좌번호|통장번호)")),
 ]
 
 
@@ -80,6 +94,12 @@ def mask_pii(text: str) -> tuple[str, list[str]]:
     return masked, found
 
 
+def detect_privacy_review_flags(text: str) -> list[str]:
+    """Flag explicit high-risk contexts without broadly masking normal prose."""
+
+    return [name for name, pattern in PRIVACY_REVIEW_PATTERNS if pattern.search(text)]
+
+
 def preprocess_documents(
     rows: list[dict[str, Any]],
     text_column: str,
@@ -91,6 +111,7 @@ def preprocess_documents(
         original = normalize_text(row.get(text_column))
         no_opinion = is_no_opinion(original)
         redacted, pii_found = mask_pii(original)
+        privacy_review_flags = detect_privacy_review_flags(original)
         metadata = {col: row.get(col) for col in metadata_columns if col in row}
         if original == "" and not no_opinion:
             no_opinion = True
@@ -104,6 +125,7 @@ def preprocess_documents(
                 metadata=metadata,
                 is_no_opinion=no_opinion,
                 pii_found=pii_found,
+                privacy_review_flags=privacy_review_flags,
             )
         )
     return documents

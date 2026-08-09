@@ -72,6 +72,49 @@ class StorageRepositoryTests(unittest.TestCase):
             self.assertEqual(restored.assignments[0].document_id, "doc_1")
             self.assertEqual([item.run_id for item in reopened.list_runs("dataset_test")], ["run_test"])
 
+    def test_delete_run_removes_only_requested_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = StorageRepository(Path(tmp) / "app.db")
+            package = _analysis_package()
+            repo.save_run(package=package, run_id="run_test", dataset_id="dataset_test")
+            repo.save_run(package=package, run_id="run_other", dataset_id="dataset_other")
+
+            deleted = repo.delete_run("run_test")
+
+            self.assertTrue(deleted.deleted)
+            self.assertIsNone(repo.get_run("run_test"))
+            self.assertIsNotNone(repo.get_run("run_other"))
+            self.assertFalse(repo.delete_run("run_missing").deleted)
+
+    def test_dataset_delete_is_blocked_until_cascade_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = StorageRepository(Path(tmp) / "app.db")
+            profile = _profile()
+            repo.save_dataset(data=b"feedback\nhello\n", filename="survey.csv", profile=profile)
+            repo.save_dataset(
+                data=b"feedback\nkeep\n",
+                filename="other.csv",
+                profile=profile,
+                dataset_id="dataset_other",
+            )
+            package = _analysis_package()
+            repo.save_run(package=package, run_id="run_test", dataset_id="dataset_test")
+            repo.save_run(package=package, run_id="run_other", dataset_id="dataset_other")
+
+            blocked = repo.delete_dataset("dataset_test")
+            self.assertFalse(blocked.deleted)
+            self.assertEqual(blocked.blocked_by_run_ids, ("run_test",))
+            self.assertIsNotNone(repo.get_dataset("dataset_test"))
+
+            deleted = repo.delete_dataset("dataset_test", delete_runs=True)
+            self.assertTrue(deleted.deleted)
+            self.assertEqual(deleted.deleted_run_ids, ("run_test",))
+            self.assertIsNone(repo.get_dataset("dataset_test"))
+            self.assertIsNone(repo.get_run("run_test"))
+            self.assertIsNotNone(repo.get_dataset("dataset_other"))
+            self.assertIsNotNone(repo.get_run("run_other"))
+            self.assertFalse(repo.delete_dataset("dataset_missing").deleted)
+
 
 def _profile() -> DatasetProfile:
     column = ColumnProfile(

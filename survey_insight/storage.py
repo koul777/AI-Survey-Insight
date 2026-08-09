@@ -51,6 +51,20 @@ class StoredRun(StoredRunSummary):
     pass
 
 
+@dataclass(frozen=True)
+class RunDeleteResult:
+    run_id: str
+    deleted: bool
+
+
+@dataclass(frozen=True)
+class DatasetDeleteResult:
+    dataset_id: str
+    deleted: bool
+    deleted_run_ids: tuple[str, ...] = ()
+    blocked_by_run_ids: tuple[str, ...] = ()
+
+
 def dumps_json(value: Any) -> str:
     """Serialize app dataclasses and plain JSON values for SQLite storage."""
 
@@ -236,6 +250,49 @@ class StorageRepository:
             package_json=loads_json(row["package_json"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    def delete_run(self, run_id: str) -> RunDeleteResult:
+        """Delete exactly one analysis run and report whether it existed."""
+
+        with self._connection() as conn:
+            cursor = conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        return RunDeleteResult(run_id=run_id, deleted=cursor.rowcount == 1)
+
+    def delete_dataset(self, dataset_id: str, *, delete_runs: bool = False) -> DatasetDeleteResult:
+        """Delete a dataset, optionally deleting its linked runs in one transaction.
+
+        The conservative default refuses to delete a dataset that still has runs.
+        Callers must explicitly opt in to the cascade.
+        """
+
+        with self._connection() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM datasets WHERE dataset_id = ?",
+                (dataset_id,),
+            ).fetchone()
+            if exists is None:
+                return DatasetDeleteResult(dataset_id=dataset_id, deleted=False)
+            linked_run_ids = tuple(
+                str(row["run_id"])
+                for row in conn.execute(
+                    "SELECT run_id FROM runs WHERE dataset_id = ? ORDER BY run_id",
+                    (dataset_id,),
+                ).fetchall()
+            )
+            if linked_run_ids and not delete_runs:
+                return DatasetDeleteResult(
+                    dataset_id=dataset_id,
+                    deleted=False,
+                    blocked_by_run_ids=linked_run_ids,
+                )
+            if linked_run_ids:
+                conn.execute("DELETE FROM runs WHERE dataset_id = ?", (dataset_id,))
+            cursor = conn.execute("DELETE FROM datasets WHERE dataset_id = ?", (dataset_id,))
+        return DatasetDeleteResult(
+            dataset_id=dataset_id,
+            deleted=cursor.rowcount == 1,
+            deleted_run_ids=linked_run_ids,
         )
 
     def _init_db(self) -> None:

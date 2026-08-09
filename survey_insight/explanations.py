@@ -10,6 +10,7 @@ ENGINE_LABELS = {
     "kmeans": "KMeans 군집",
     "agglomerative": "계층 군집",
     "nmf": "NMF 토픽모델",
+    "nmf_kl": "KL-NMF 토픽모델",
     "lda": "LDA 토픽모델",
     "openai_embedding_kmeans": "OpenAI 의미 임베딩 KMeans",
     "openai_embedding_agglomerative": "OpenAI 의미 임베딩 계층 군집",
@@ -55,11 +56,18 @@ def apply_topic_explanation(topic: Topic) -> Topic:
 
 def _recommendation_summary(recommendation: Recommendation) -> str:
     rec = recommendation.recommended
+    weight_acceptability = rec.metrics.get("weight_acceptability")
+    sensitivity_text = (
+        f" 가중치 변동 시나리오 선정률은 {weight_acceptability:.0%}였습니다."
+        if weight_acceptability is not None
+        else ""
+    )
     return (
         f"유효 자유응답 {recommendation.valid_response_count}건을 읽기 쉬운 묶음으로 나누어 보니 "
-        f"{rec.topic_count}개 토픽이 가장 균형 잡힌 결과로 선택되었습니다. "
+        f"{rec.topic_count}개 토픽이 현재 복합 평가 기준의 권장안으로 선택되었습니다. "
+        f"{sensitivity_text}"
         "토픽이 너무 적으면 서로 다른 의견이 섞이고, 너무 많으면 비슷한 이야기가 잘게 쪼개질 수 있어 "
-        "그 중간 지점을 권장값으로 잡았습니다."
+        "대표 응답 검토가 가능한 중간 지점을 권장값으로 잡았습니다. 이 값은 통계적으로 검증된 최적값이 아닙니다."
     )
 
 
@@ -71,10 +79,12 @@ def _topic_count_explanation(recommendation: Recommendation) -> str:
     return (
         f"허용 범위 {recommendation.allowed_topic_range[0]}-{recommendation.allowed_topic_range[1]}개 안에서 "
         f"{engines}을 함께 비교했습니다. 토픽 수는 두 가지 관점으로 정했습니다. "
-        "첫째, 응답이 한 토픽 안에서 잘 모이고 토픽끼리는 충분히 다른지 보는 품질 점수를 확인했습니다. "
-        "둘째, 담당자가 실제로 읽고 이름을 붙일 수 있을 만큼 토픽이 너무 크거나 잘게 쪼개지지 않았는지 확인했습니다. "
+        "첫째, 키워드 동시출현, 군집 분리도, 포함률과 토픽 크기 균형을 결합한 휴리스틱 점수를 확인했습니다. "
+        "둘째, 문서화된 가중치를 범위 안에서 바꾼 시나리오에서도 어떤 후보가 선택되는지 확인했습니다. "
+        "셋째, 담당자가 실제로 읽고 이름을 붙일 수 있을 만큼 토픽이 너무 크거나 잘게 쪼개지지 않았는지 확인했습니다. "
         f"작은 토픽이 과하게 생기지 않는지, 사람이 라벨을 붙일 수 있는지도 함께 평가했습니다. "
-        f"그 결과 {rec.topic_count}개 토픽이 추천되었고, 더 넓게 보는 대안은 {wider}, 더 세분화하는 대안은 {detailed}입니다."
+        f"그 결과 {rec.topic_count}개 토픽을 권장하며, 더 넓게 보는 대안은 {wider}, 더 세분화하는 대안은 {detailed}입니다. "
+        "권장안과 대안의 대표 응답을 사람이 비교한 뒤 최종 토픽 수를 결정해야 합니다."
     )
 
 
@@ -87,7 +97,8 @@ def _methodology_explanation(recommendation: Recommendation) -> str:
         "분석은 무응답과 개인정보 단서를 먼저 정리한 뒤, 한국어 키워드를 뽑고 여러 토픽 후보를 만들어 비교하는 순서로 진행됩니다. "
         f"이번 권장안은 {ENGINE_LABELS.get(engine, engine)} 결과이며, 키워드 추출 방식은 {tokenizer}입니다. "
         f"{embedding_text}"
-        "표의 점수는 모델 선택을 돕는 근거이고, 최종 의사결정에는 대표 의견 원문을 함께 확인해야 합니다."
+        "가중치 시나리오 선정률과 bootstrap 구조 관문 통과율은 선택 민감도와 표본 변동성을 보여주는 진단값입니다. "
+        "정확도, p-value 또는 통계적 검정력이 아니며 최종 의사결정에는 대표 의견 원문을 함께 확인해야 합니다."
     )
 
 
@@ -96,9 +107,13 @@ def _quality_warnings(recommendation: Recommendation) -> list[str]:
     if recommendation.valid_response_count < 30:
         warnings.append("응답 수가 적기 때문에 토픽 이름과 비율은 확정 결론보다 탐색용 단서로 읽어야 합니다.")
     if any(topic.sentiment_method == "rule_lexicon_fallback" for topic in recommendation.recommended.topics):
-        warnings.append("감정분석은 현재 로컬 규칙 기반 보조 판정입니다. API 키 기반 정밀 해석이 없으면 참고 신호로만 사용하세요.")
+        warnings.append("감정 결과는 규칙·어휘 기반 신호입니다. 심리 진단이나 긴급성 판정이 아니므로 대표 응답과 함께 검토하세요.")
     if recommendation.recommended.params.get("tokenizer") == "regex_keyword_fallback":
         warnings.append("한국어 형태소 분석기가 설치되어 있지 않아 2글자 이상 키워드 추출 fallback을 사용했습니다.")
+    if recommendation.recommended.metrics.get("weight_acceptability", 1.0) < 0.50:
+        warnings.append("가중치 범위에 따라 권장 후보가 달라질 수 있으므로 대안 후보도 함께 비교하세요.")
+    if recommendation.recommended.metrics.get("bootstrap_gate_pass_rate", 1.0) < 0.80:
+        warnings.append("Bootstrap에서 작은 토픽 또는 포함률 관문이 자주 흔들려 토픽 비율을 확정값으로 읽으면 안 됩니다.")
     return warnings
 
 
