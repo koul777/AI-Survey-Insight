@@ -1,6 +1,6 @@
 [project]
 name = "ai-survey-insight"
-version = "0.2.0"
+version = "0.2.1"
 description = "AI-assisted Korean survey free-response analysis and report generation"
 requires-python = ">=3.11"
 dependencies = [

@@ -677,13 +677,14 @@ def _result_quality_review_reasons(candidate: CandidateSolution) -> list[str]:
     return reasons
 
 
-def _cluster(matrix: Any, k: int, seed: int) -> np.ndarray | None:
+def _cluster(matrix: Any, k: int, seed: int, *, use_minibatch: bool | None = None) -> np.ndarray | None:
     n = matrix.shape[0]
     if k <= 1:
         return np.zeros(n, dtype=int)
     if n < k:
         return None
-    if n > LARGE_DATASET_THRESHOLD:
+    large_dataset = n > LARGE_DATASET_THRESHOLD if use_minibatch is None else use_minibatch
+    if large_dataset:
         model = MiniBatchKMeans(
             n_clusters=k,
             random_state=seed,
@@ -713,16 +714,18 @@ def _evaluate_candidates_in_common_space(candidates: list[CandidateSolution], do
             + candidate.metrics["balance"] * 0.2 + 0.1 - small_ratio * 0.2)), 3)
         candidate.score = round(_composite_score(candidate.metrics, candidate.metrics["penalty"], SCORE_WEIGHTS), 3)
         candidate.params["evaluation_space"] = space
-        candidate.params["metric_profile"] = "heuristic_v5_common_space"
+        candidate.params["metric_profile"] = "heuristic_v6_scale_invariant_diagnostics"
 
 
-def _cluster_embeddings_kmeans(matrix: np.ndarray, k: int, seed: int) -> np.ndarray | None:
+def _cluster_embeddings_kmeans(matrix: np.ndarray, k: int, seed: int,
+                               *, use_minibatch: bool | None = None) -> np.ndarray | None:
     n = matrix.shape[0]
     if k <= 1:
         return np.zeros(n, dtype=int)
     if n < k:
         return None
-    if n > LARGE_DATASET_THRESHOLD:
+    large_dataset = n > LARGE_DATASET_THRESHOLD if use_minibatch is None else use_minibatch
+    if large_dataset:
         model = MiniBatchKMeans(
             n_clusters=k,
             random_state=seed,
@@ -808,17 +811,25 @@ def _fit_nmf(
     k: int,
     seed: int,
     objective: str = "frobenius",
+    *,
+    use_minibatch: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     n_docs, n_features = matrix.shape
     if k <= 1:
         weights = np.ones((n_docs, 1), dtype=float)
         components = np.asarray(matrix.mean(axis=0), dtype=float).reshape(1, -1)
-        return np.zeros(n_docs, dtype=int), weights, components
+        weights, components = _normalize_nmf_factors(weights, components)
+        labels = np.zeros(n_docs, dtype=int)
+        empty_rows = np.asarray(matrix.sum(axis=1)).ravel() <= 0
+        labels[empty_rows] = -1
+        weights[empty_rows] = 0.0
+        return labels, weights, components
     if n_docs < k or n_features < k:
         return None
     init = "nndsvda" if min(n_docs, n_features) > k else "random"
     if objective == "frobenius":
-        if n_docs > LARGE_DATASET_THRESHOLD:
+        large_dataset = n_docs > LARGE_DATASET_THRESHOLD if use_minibatch is None else use_minibatch
+        if large_dataset:
             model = MiniBatchNMF(n_components=k, init=init, random_state=seed, max_iter=100,
                                 batch_size=min(1024, n_docs))
         else:
@@ -845,10 +856,28 @@ def _fit_nmf(
         return None
     if any(issubclass(item.category, ConvergenceWarning) for item in caught):
         return None
+    weights, components = _normalize_nmf_factors(weights, model.components_)
     labels = np.asarray(weights.argmax(axis=1), dtype=int)
-    if len(set(labels)) != k:
+    labels[np.asarray(weights.sum(axis=1)).ravel() <= 0] = -1
+    if _topic_count_from_labels(labels) != k:
         return None
-    return labels, np.asarray(weights), np.asarray(model.components_)
+    return labels, weights, components
+
+
+def _normalize_nmf_factors(weights: np.ndarray, components: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Express W as reconstructed term mass and H as topic term distributions.
+
+    NMF admits W D and D^-1 H for any positive diagonal D. Comparing raw W
+    columns therefore makes assignments depend on an arbitrary factor scale.
+    Moving every component's L1 mass into W preserves W @ H and makes both
+    hard labels and relative memberships invariant to that scale.
+    """
+    weights = np.asarray(weights, dtype=float)
+    components = np.asarray(components, dtype=float)
+    mass = components.sum(axis=1)
+    normalized = np.divide(components, mass[:, None], out=np.zeros_like(components),
+                           where=mass[:, None] > 0)
+    return weights * mass[None, :], normalized
 
 
 def _cluster_nmf(matrix: Any, k: int, seed: int) -> np.ndarray | None:
@@ -933,7 +962,7 @@ def _candidate_from_labels(
     quality_gate_reasons = _quality_gate_reasons(labels, topics, min_topic_size)
     input_diagnostics: dict[str, Any] = {}
     if source == "lda":
-        input_diagnostics = _lda_input_diagnostics(matrix)
+        input_diagnostics = _lda_input_diagnostics(matrix, vectorizer)
         if not input_diagnostics["input_evidence_sufficient"]:
             quality_gate_reasons.append(
                 "LDA 입력의 절반 이상이 서로 다른 유효 단어 3개 미만인 짧은 응답입니다."
@@ -947,8 +976,13 @@ def _candidate_from_labels(
             "engine": source,
             "min_topic_size": min_topic_size,
             "tokenizer": tokenizer_source(),
-            "metric_profile": "heuristic_v4_topic_representation",
+            "metric_profile": "heuristic_v6_scale_invariant_diagnostics",
+            "coherence_method": "umass_style_exponentiated",
+            "coherence_diagnostic_method": "jeffreys_smoothed_conditional_cooccurrence",
+            "coherence_diagnostic_in_score": False,
             "assignment_score_note": "모델 소속도이며 분류 정확도나 보정된 신뢰확률이 아닙니다.",
+            **({"nmf_weight_normalization": "reconstructed_term_mass_l1"}
+               if source.startswith("nmf") else {}),
             "requested_topic_count": k,
             "quality_gate_passed": not quality_gate_reasons,
             "quality_gate_reasons": quality_gate_reasons,
@@ -1003,6 +1037,7 @@ def _topics_from_labels(
                 sentiment_method=sentiment.source,
                 sentiment_distribution=sentiment.label_counts,
                 sentiment_evidence_coverage=sentiment.evidence_coverage,
+                sentiment_review_count=sentiment.review_count,
             )
         )
     assignments = [
@@ -1045,6 +1080,7 @@ def _restore_document_frequencies(candidate: CandidateSolution, fitted: list[Tex
         topic.sentiment_evidence = list(aggregate.evidence_terms)
         topic.sentiment_distribution = aggregate.label_counts
         topic.sentiment_evidence_coverage = aggregate.evidence_coverage
+        topic.sentiment_review_count = aggregate.review_count
     candidate.params["model_fit_document_count"] = len(fitted)
     candidate.params["reported_document_count"] = len(documents)
     candidate.params["metric_unit"] = "unique_response_text"
@@ -1114,6 +1150,7 @@ def _topics_from_components(
                 sentiment_method=sentiment.source,
                 sentiment_distribution=sentiment.label_counts,
                 sentiment_evidence_coverage=sentiment.evidence_coverage,
+                sentiment_review_count=sentiment.review_count,
             )
         )
     assignments: list[TopicAssignment] = []
@@ -1281,6 +1318,8 @@ def _metrics(
     coverage = sum(int(label) != -1 for label in labels) / max(1, len(labels))
     diversity = _topic_diversity(topics)
     coherence = _coherence(vectorizer, coherence_matrix if coherence_matrix is not None else matrix, topics)
+    coherence_smoothed = _coherence(vectorizer, coherence_matrix if coherence_matrix is not None else matrix,
+                                    topics, smoothing="jeffreys")
     representation_completeness = sum(
         min(1.0, (min(len(topic.keywords), 5) / 5.0) * 0.6 + (min(len(topic.representative_responses), 3) / 3.0) * 0.4)
         for topic in topics
@@ -1299,6 +1338,7 @@ def _metrics(
     return {
         "stability": round(stability, 3),
         "coherence": round(coherence, 3),
+        "coherence_smoothed": round(coherence_smoothed, 3),
         "semantic_quality": round(semantic_quality, 3),
         "coverage": round(coverage, 3),
         "diversity": round(diversity, 3),
@@ -1357,15 +1397,21 @@ def _coherence(
     vectorizer: TfidfVectorizer | CountVectorizer,
     matrix: Any,
     topics: list[Topic],
+    *,
+    smoothing: str = "umass",
 ) -> float:
-    """Return a bounded UMass-style document co-occurrence heuristic.
+    """Return a bounded document conditional co-occurrence heuristic.
 
-    The raw UMass measure is the mean log conditional co-occurrence of ordered
-    top-word pairs. ``exp(raw)`` maps it to 0..1 for the existing API. This is
-    useful for ranking candidates in one corpus but is not a calibrated
-    probability or a replacement for human topic-interpretability review.
+    Default scoring preserves the exponentiated UMass-style definition from
+    v0.2.0. Its +1 smoothing can give 1.0 to disjoint singleton words. A second,
+    diagnostic-only value uses the Jeffreys Beta(1/2, 1/2) posterior mean
+    ``(co_count + 0.5) / (reference_count + 1)`` before log aggregation. It is
+    deliberately not mixed into the selection score: these scales differ.
+    Neither value is a probability that a topic is interpretable.
     """
 
+    if smoothing not in {"umass", "jeffreys"}:
+        raise ValueError(f"Unsupported coherence smoothing: {smoothing}")
     if not topics or matrix.shape[0] == 0:
         return 0.0
     vocabulary = getattr(vectorizer, "vocabulary_", {})
@@ -1379,8 +1425,12 @@ def _coherence(
                 left = binary[:, indices[later]]
                 right = binary[:, indices[earlier]]
                 co_documents = float(left.multiply(right).sum())
-                reference_documents = max(1.0, float(right.sum()))
-                raw = math.log(min(1.0, (co_documents + 1.0) / reference_documents))
+                reference_documents = float(right.sum())
+                if smoothing == "jeffreys":
+                    conditional = (co_documents + 0.5) / (reference_documents + 1.0)
+                else:
+                    conditional = min(1.0, (co_documents + 1.0) / max(1.0, reference_documents))
+                raw = math.log(conditional)
                 pair_scores.append(raw)
         if pair_scores:
             scores.append(math.exp(sum(pair_scores) / len(pair_scores)))
@@ -1419,13 +1469,23 @@ def _quality_gate_reasons(
     return reasons
 
 
-def _lda_input_diagnostics(matrix: Any) -> dict[str, Any]:
-    distinct_terms = np.asarray((matrix > 0).sum(axis=1)).ravel()
+def _lda_input_diagnostics(matrix: Any, vectorizer: Any | None = None) -> dict[str, Any]:
+    # A two-word response has three (1, 2)-gram features. The bigram is not
+    # additional word evidence and must not satisfy the three-word minimum.
+    word_matrix = matrix
+    unit = "input_feature"
+    if vectorizer is not None:
+        feature_names = vectorizer.get_feature_names_out()
+        unigram_columns = [index for index, term in enumerate(feature_names) if " " not in str(term)]
+        word_matrix = matrix[:, unigram_columns]
+        unit = "unigram"
+    distinct_terms = np.asarray((word_matrix > 0).sum(axis=1)).ravel()
     if distinct_terms.size == 0:
         return {
             "input_median_distinct_terms": 0.0,
             "input_short_response_share": 1.0,
             "input_evidence_sufficient": False,
+            "input_term_count_unit": unit,
         }
     median_terms = float(np.median(distinct_terms))
     short_share = float(np.mean(distinct_terms < 3))
@@ -1433,6 +1493,7 @@ def _lda_input_diagnostics(matrix: Any) -> dict[str, Any]:
         "input_median_distinct_terms": round(median_terms, 3),
         "input_short_response_share": round(short_share, 3),
         "input_evidence_sufficient": short_share < 0.50,
+        "input_term_count_unit": unit,
     }
 
 
@@ -1648,6 +1709,7 @@ def _attach_resampling_diagnostic(
             embedding_matrix[indices] if embedding_matrix is not None else None,
             candidate.topic_count,
             seed + repeat + 1,
+            use_minibatch=tfidf_matrix.shape[0] > LARGE_DATASET_THRESHOLD,
         )
         if fitted is None or len(fitted) != len(indices):
             continue
@@ -1790,13 +1852,16 @@ def _refit_candidate_labels(
     embedding_matrix: np.ndarray | None,
     topic_count: int,
     seed: int,
+    *,
+    use_minibatch: bool | None = None,
 ) -> np.ndarray | None:
     if engine == "kmeans":
-        return _cluster(tfidf_matrix, topic_count, seed)
+        return _cluster(tfidf_matrix, topic_count, seed, use_minibatch=use_minibatch)
     if engine == "agglomerative":
         return _cluster_agglomerative(tfidf_matrix, topic_count)
     if engine in {"nmf", "nmf_minibatch"}:
-        solution = _fit_nmf(tfidf_matrix, topic_count, seed)
+        solution = _fit_nmf(tfidf_matrix, topic_count, seed,
+                            use_minibatch=True if engine == "nmf_minibatch" else use_minibatch)
         return solution[0] if solution is not None else None
     if engine == "nmf_kl":
         solution = _fit_nmf(tfidf_matrix, topic_count, seed, objective="kullback-leibler")
@@ -1805,7 +1870,7 @@ def _refit_candidate_labels(
         solution = _fit_lda(count_matrix, topic_count, seed)
         return solution[0] if solution is not None else None
     if engine.endswith("_kmeans") and embedding_matrix is not None:
-        return _cluster_embeddings_kmeans(embedding_matrix, topic_count, seed)
+        return _cluster_embeddings_kmeans(embedding_matrix, topic_count, seed, use_minibatch=use_minibatch)
     if engine.endswith("_agglomerative") and embedding_matrix is not None:
         return _cluster_agglomerative(embedding_matrix, topic_count)
     return None

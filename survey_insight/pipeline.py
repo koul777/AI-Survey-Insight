@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -101,10 +101,18 @@ def analyze_table(
     is_kakao_chat = is_kakao_chat_table(table) and selected_text_column == "메시지"
     if is_kakao_chat:
         analysis_rows, chat_preprocessing = prepare_kakao_chat_rows(table.rows)
+        # A context may contain several authors and timestamps. Counting it as
+        # one member of an author group would fabricate a respondent-level unit.
+        selected_group_columns = []
         dataset_profile.warnings.append(
-            "카카오톡 대화는 시스템·봇·짧은 반응을 제외하고 연속 메시지를 맥락 구간으로 묶어 분석합니다."
+            "카카오톡 대화는 시스템·봇·명시적 반응을 제외하고 연속 메시지를 맥락 구간으로 묶어 분석합니다. "
+            "맥락 구간에는 여러 발화자가 포함될 수 있어 집단별 교차표는 생성하지 않습니다."
         )
     documents = preprocess_documents(analysis_rows, selected_text_column, metadata_columns=selected_group_columns)
+    if is_kakao_chat:
+        for document, row in zip(documents, analysis_rows):
+            document.metadata["_source_row_indices"] = row["_source_row_indices"]
+            document.metadata["_source_message_count"] = row["원문메시지수"]
     for document in valid_documents(documents):
         document.topic_tokens = tokenize_keywords(document.redacted_text)
         document.sentiment = sentiment_payload(analyze_text_sentiment(document.redacted_text))
@@ -126,6 +134,8 @@ def analyze_table(
             f"카카오톡 원문 {chat_preprocessing['source_rows']}행 중 잡음을 제외한 "
             f"{chat_preprocessing['retained_messages']}개 메시지를 "
             f"{chat_preprocessing['context_segments']}개 맥락 구간으로 묶어 분석했습니다."
+            " 토픽·감정의 건수는 맥락 구간 수이며, 사람 수나 개별 발화 수가 아닙니다. "
+            "혼합 감정에는 서로 다른 발화자의 의견이 함께 포함될 수 있습니다."
         )
         recommendation.warnings.insert(0, chat_warning)
         recommendation.quality_warnings = list(
@@ -139,7 +149,13 @@ def analyze_table(
         "average_score": sentiment.average_polarity_score,
         "evidence_coverage": sentiment.evidence_coverage,
         "no_evidence_count": sum(doc.sentiment.get("evidence_status") == "no_match" for doc in documents),
+        "needs_review_count": sum(bool(doc.sentiment.get("needs_review")) for doc in documents),
+        "review_reason_counts": dict(Counter(
+            reason for doc in documents for reason in doc.sentiment.get("review_reasons", [])
+        )),
         "lexicon": sentiment_lexicon_info(),
+        "analysis_unit": "context_segment" if is_kakao_chat else "response",
+        "source_message_count": chat_preprocessing["retained_messages"] if chat_preprocessing else None,
     }
     recommendation.analysis_diagnostics.update(preprocessing_diagnostics(documents))
     cross = build_cross_analysis(valid_documents(documents), selected.assignments, selected.topics, selected_group_columns)
@@ -150,7 +166,7 @@ def analyze_table(
             "analysis_seed": seed,
             "privacy_review_flag_count": privacy_review_flag_count,
             "chat_preprocessing": chat_preprocessing,
-            "analysis_version": "0.2.0",
+            "analysis_version": "0.2.1",
         },
         dataset_profile=dataset_profile,
         text_column=selected_text_column,
@@ -171,9 +187,11 @@ def build_cross_analysis(
     group_columns: list[str],
     suppress_threshold: int = 5,
 ) -> list[dict[str, Any]]:
-    doc_by_id = {doc.id: doc for doc in documents}
     topic_labels = {topic.topic_id: topic.label for topic in topics}
-    assigned_topic = {assignment.document_id: assignment.topic_id for assignment in assignments}
+    assigned_topic = {
+        assignment.document_id: assignment.topic_id for assignment in assignments
+        if not assignment.is_outlier and assignment.topic_id in topic_labels
+    }
     counts: dict[tuple[str, str, str], int] = defaultdict(int)
     totals: dict[tuple[str, str], int] = defaultdict(int)
     sentiment_counts: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
@@ -191,6 +209,10 @@ def build_cross_analysis(
             if label in sentiment_counts[key]:
                 sentiment_counts[key][label] += 1
     rows: list[dict[str, Any]] = []
+    suppressed_groups = {
+        (column, value) for (column, value, _), count in counts.items()
+        if count < suppress_threshold
+    }
     for (column, value, topic_id), count in sorted(counts.items()):
         total = totals[(column, value)]
         suppressed = count < suppress_threshold
@@ -200,11 +222,14 @@ def build_cross_analysis(
                 "group_value": value,
                 "topic_id": topic_id,
                 "topic_label": topic_labels.get(topic_id, topic_id),
-                "count": count,
-                "share": round(count / max(1, total), 4),
+                "count": None if suppressed else count,
+                "share": None if (column, value) in suppressed_groups else round(count / max(1, total), 4),
                 "display_count": None if suppressed else count,
                 "suppressed": suppressed,
-                "sentiment_counts": None if suppressed else sentiment_counts[(column, value, topic_id)],
+                "sentiment_counts": (
+                    None if suppressed or sum(sentiment_counts[(column, value, topic_id)].values()) != count
+                    else sentiment_counts[(column, value, topic_id)]
+                ),
             }
         )
     return rows

@@ -33,6 +33,36 @@ class ApiTests(unittest.TestCase):
             cache.clear()
             self.addCleanup(cache.clear)
 
+    def test_chat_document_endpoint_exposes_source_rows_and_context_unit(self) -> None:
+        from survey_insight.models import TableData
+        from survey_insight.pipeline import analyze_table
+
+        rows = [
+            {"날짜": "2026-10-13", "시간": "09:00", "작성자": "A", "메시지": "사진", "유형": "메시지"},
+            {"날짜": "2026-10-13", "시간": "09:01", "작성자": "A", "메시지": "교육 좋아요", "유형": "메시지"},
+            {"날짜": "2026-10-13", "시간": "09:02", "작성자": "B", "메시지": "급여 불만", "유형": "메시지"},
+        ]
+        package = analyze_table(TableData(list(rows[0]), rows), text_column="메시지")
+        _STORE.save_run(package=package)
+        response = TestClient(app).get(f"/model-runs/{package.recommendation.run_id}/documents")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["analysis_unit"], "context_segment")
+        self.assertEqual(payload["items"][0]["source_row_indices"], [2, 3])
+        self.assertEqual(payload["items"][0]["source_message_count"], 2)
+        self.assertNotIn("original_text", payload["items"][0])
+        # Old context results have no message-to-row mapping. Never fabricate
+        # one from the context ordinal when loading them through the API.
+        for document in package.documents:
+            document.metadata = {}
+        package.recommendation.sentiment_summary.pop("analysis_unit")
+        package.recommendation.sentiment_summary.pop("source_message_count")
+        _STORE.save_run(package=package)
+        api_module._RUNS.clear()
+        legacy = TestClient(app).get(f"/model-runs/{package.recommendation.run_id}/documents").json()
+        self.assertEqual(legacy["analysis_unit"], "context_segment")
+        self.assertEqual(legacy["items"][0]["source_row_indices"], [])
+
     def test_document_sentiment_endpoint_is_redacted_filtered_and_persisted(self) -> None:
         from survey_insight.models import TableData
         from survey_insight.pipeline import analyze_table

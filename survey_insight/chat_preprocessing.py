@@ -11,7 +11,8 @@ from .preprocessing import normalize_text
 KAKAO_CHAT_HEADERS = {"날짜", "시간", "작성자", "메시지", "유형"}
 CHAT_BOT_NAMES = {"오픈채팅봇"}
 ATTACHMENT_ONLY = re.compile(r"^(?:사진|동영상|이모티콘|파일)(?:\s*\d+장)?$")
-REACTION_ONLY = re.compile(r"^[ㅋㅎㅠㅜ~!?.…\s]+$")
+# Include NFKC-normalized Hangul jamo as well as their compatibility forms.
+REACTION_ONLY = re.compile(r"^[ㅋㅎㅠㅜ\u110f\u1112\u1172\u116e~!?.…\s]+$")
 SHORT_CHAT_NOISE = {
     "네",
     "넵",
@@ -52,6 +53,8 @@ def prepare_kakao_chat_rows(
     max_chars_per_segment: int = 1200,
     inactivity_minutes: int = 20,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    if min(max_messages_per_segment, max_chars_per_segment, inactivity_minutes) < 1:
+        raise ValueError("대화 구간의 메시지 수·글자 수·시간 간격은 1 이상이어야 합니다.")
     retained: list[dict[str, Any]] = []
     stats = {
         "source_rows": len(rows),
@@ -61,7 +64,7 @@ def prepare_kakao_chat_rows(
         "retained_messages": 0,
         "context_segments": 0,
     }
-    for row in rows:
+    for source_row_index, row in enumerate(rows, start=1):
         if normalize_text(row.get("유형")) != "메시지":
             stats["system_rows_removed"] += 1
             continue
@@ -72,7 +75,7 @@ def prepare_kakao_chat_rows(
         if _is_chat_noise(message):
             stats["noise_rows_removed"] += 1
             continue
-        retained.append({**row, "메시지": message})
+        retained.append({**row, "메시지": message, "_source_row_index": source_row_index})
 
     segments: list[dict[str, Any]] = []
     buffer: list[dict[str, Any]] = []
@@ -92,6 +95,7 @@ def prepare_kakao_chat_rows(
                 "메시지": "\n".join(str(item["메시지"]) for item in buffer),
                 "유형": "대화구간",
                 "원문메시지수": len(buffer),
+                "_source_row_indices": [item["_source_row_index"] for item in buffer],
             }
         )
         buffer = []
@@ -104,7 +108,8 @@ def prepare_kakao_chat_rows(
         gap_is_large = (
             last_timestamp is not None
             and timestamp is not None
-            and (timestamp - last_timestamp).total_seconds() >= inactivity_minutes * 60
+            and ((timestamp - last_timestamp).total_seconds() >= inactivity_minutes * 60
+                 or timestamp < last_timestamp)
         )
         exceeds_size = bool(buffer) and (
             len(buffer) >= max_messages_per_segment
@@ -132,7 +137,9 @@ def _is_chat_noise(message: str) -> bool:
         return True
     if compact.casefold() in {value.casefold() for value in SHORT_CHAT_NOISE}:
         return True
-    return len(compact) < 5
+    # Length alone cannot distinguish a reaction from a substantive opinion:
+    # e.g. "불편해요", "임금체불", "앱 오류". Only explicit noise is removed.
+    return False
 
 
 def _row_timestamp(row: dict[str, Any]) -> datetime | None:

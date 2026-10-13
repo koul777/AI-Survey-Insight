@@ -86,6 +86,7 @@ class Topic:
     sentiment_distribution: dict[str, int] = field(default_factory=dict)
     sentiment_evidence_coverage: float = 0.0
     sentiment_distribution_method: str = "document_lexicon"
+    sentiment_review_count: int = 0
 
 
 @dataclass
