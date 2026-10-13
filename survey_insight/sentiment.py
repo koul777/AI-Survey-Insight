@@ -107,7 +107,9 @@ def _compiled_lexicon(backend_source: str) -> dict[str, list[tuple[tuple[str, ..
         sequences: set[tuple[str, ...]] = set()
         for phrase in sorted(phrases):
             tokens = list(analyze_morphemes(phrase))
-            while tokens and tokens[-1].tag in {"EF", "EP", "XSA", "XSV", "VCP"}:
+            # Citation-form 다 may be tagged EC or EF depending on context
+            # and Kiwi model version. Both must reduce to the same stem.
+            while tokens and tokens[-1].tag in {"EF", "EC", "EP", "XSA", "XSV", "VCP"}:
                 tokens.pop()
             signature = tuple(token.form for token in tokens)
             if signature and signature not in sequences:

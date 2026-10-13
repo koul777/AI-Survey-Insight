@@ -238,7 +238,7 @@ def analyze_morphemes(text: str) -> tuple[Morpheme, ...]:
     if source.startswith("kiwi"):
         return tuple(Morpheme(str(t.form).lower(), str(t.tag).split("-")[0],
                               int(t.start), int(t.start + t.len), int(t.sent_position))
-                     for t in backend.tokenize(text, normalize_coda=True))
+                     for t in backend.tokenize(text, normalize_coda=True, split_complex=True))
     if source.startswith("konlpy_okt"):
         # Okt does not provide reliable character spans; use the conservative
         # lexical fallback for sentiment and preserve its noun extraction.
@@ -254,7 +254,7 @@ def preprocessing_diagnostics(documents: list[TextDocument]) -> dict[str, Any]:
     valid = valid_documents(documents)
     counts = [len(tokenize_keywords(doc.redacted_text)) for doc in valid]
     versions = {}
-    for package in ("kiwipiepy", "scikit-learn", "numpy"):
+    for package in ("kiwipiepy", "kiwipiepy_model", "scikit-learn", "numpy"):
         try:
             versions[package] = version(package)
         except PackageNotFoundError:
@@ -262,7 +262,7 @@ def preprocessing_diagnostics(documents: list[TextDocument]) -> dict[str, Any]:
     return {
         "library_versions": versions,
         "tokenizer": tokenizer_source(),
-        "normalization": "NFKC, zero-width removal, whitespace, Kiwi normalize_coda",
+        "normalization": "NFKC, zero-width removal, whitespace, Kiwi normalize_coda + split_complex",
         "topic_pos": ["NNG", "NNP", "SL", "XR"],
         "sentiment_pos": "full morphology with negation and clause boundaries",
         "input_count": len(documents),

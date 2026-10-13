@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
   "bertopic>=0.17.4,<0.18",
   "fastapi>=0.115,<1",
-  "kiwipiepy>=0.20,<1",
+  "kiwipiepy>=0.23.2,<0.25",
   "openpyxl>=3.1,<4",
   "pandas>=2.1,<3",
   "pydantic>=2.8,<3",

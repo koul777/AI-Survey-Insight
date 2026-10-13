@@ -17,6 +17,22 @@ from survey_insight.storage import StorageRepository
 
 
 class ApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # API tests must not add synthetic uploads/runs to a user's local DB.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = StorageRepository(Path(temporary.name) / "app.db")
+        for replacement in (
+            patch.object(api_module, "_STORE", store),
+            patch(f"{__name__}._STORE", store),
+            patch.object(api_module, "_EXPORT_DIR", Path(temporary.name) / "exports"),
+        ):
+            replacement.start()
+            self.addCleanup(replacement.stop)
+        for cache in (api_module._TABLES, api_module._PROFILES, api_module._RUNS):
+            cache.clear()
+            self.addCleanup(cache.clear)
+
     def test_document_sentiment_endpoint_is_redacted_filtered_and_persisted(self) -> None:
         from survey_insight.models import TableData
         from survey_insight.pipeline import analyze_table

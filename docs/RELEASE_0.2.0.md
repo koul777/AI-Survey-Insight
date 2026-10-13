@@ -14,7 +14,7 @@
 
 ## 검증 범위
 
-- Windows / Python 3.12에서 `python -m unittest discover -s tests -v`: 100개 통과. GitHub Actions는 Python 3.11·3.12를 별도로 확인합니다.
+- Windows / Python 3.12에서 Kiwi 0.23.2·0.24.0 각각 전체 테스트 100개 통과. `split_complex`와 기본형 어미 정규화로 버전 간 파생어 분석 차이를 처리합니다. GitHub Actions는 Python 3.11·3.12를 별도로 확인합니다.
 - 자체 감정 회귀 예제 32개: 기존 12개 정답 → 32개 정답. 개발에 사용한 예제이며 외부 정확도 측정이 아닙니다.
 - 교육·급여·시설 24개 예제: 세 주제 회복 ARI 1.0. 3회 반복 자료에서도 세 주제 유지.
 - 실제 E5 모델(384차원) 로컬 추론과 의미 후보 생성 확인.
