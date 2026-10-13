@@ -226,7 +226,10 @@ def build_cross_analysis(
                 "share": None if (column, value) in suppressed_groups else round(count / max(1, total), 4),
                 "display_count": None if suppressed else count,
                 "suppressed": suppressed,
-                "sentiment_counts": None if suppressed else sentiment_counts[(column, value, topic_id)],
+                "sentiment_counts": (
+                    None if suppressed or sum(sentiment_counts[(column, value, topic_id)].values()) != count
+                    else sentiment_counts[(column, value, topic_id)]
+                ),
             }
         )
     return rows

@@ -1037,6 +1037,7 @@ def _topics_from_labels(
                 sentiment_method=sentiment.source,
                 sentiment_distribution=sentiment.label_counts,
                 sentiment_evidence_coverage=sentiment.evidence_coverage,
+                sentiment_review_count=sentiment.review_count,
             )
         )
     assignments = [
@@ -1079,6 +1080,7 @@ def _restore_document_frequencies(candidate: CandidateSolution, fitted: list[Tex
         topic.sentiment_evidence = list(aggregate.evidence_terms)
         topic.sentiment_distribution = aggregate.label_counts
         topic.sentiment_evidence_coverage = aggregate.evidence_coverage
+        topic.sentiment_review_count = aggregate.review_count
     candidate.params["model_fit_document_count"] = len(fitted)
     candidate.params["reported_document_count"] = len(documents)
     candidate.params["metric_unit"] = "unique_response_text"
@@ -1148,6 +1150,7 @@ def _topics_from_components(
                 sentiment_method=sentiment.source,
                 sentiment_distribution=sentiment.label_counts,
                 sentiment_evidence_coverage=sentiment.evidence_coverage,
+                sentiment_review_count=sentiment.review_count,
             )
         )
     assignments: list[TopicAssignment] = []

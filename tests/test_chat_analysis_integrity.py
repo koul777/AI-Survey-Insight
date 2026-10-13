@@ -77,6 +77,15 @@ class ChatAnalysisIntegrityTests(unittest.TestCase):
         self.assertTrue(all(row["share"] is None for row in rows))
         self.assertEqual(next(row for row in rows if row["topic_id"] == "T1")["count"], 5)
 
+    def test_missing_legacy_sentiment_is_unavailable_not_all_zero(self) -> None:
+        documents = [TextDocument(str(i), i + 1, "response", "교육", "교육", {"group": "A"}) for i in range(6)]
+        topics = [Topic("T1", "교육", "", 6, 1.0, [], [])]
+        assignments = [TopicAssignment(doc.id, "T1", 1.0, False, "test") for doc in documents]
+        documents[0].sentiment = {"polarity_label": "positive"}
+        row = build_cross_analysis(documents, assignments, topics, ["group"])[0]
+        self.assertEqual(row["count"], 6)
+        self.assertIsNone(row["sentiment_counts"])
+
 
 if __name__ == "__main__":
     unittest.main()

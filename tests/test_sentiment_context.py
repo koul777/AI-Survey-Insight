@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+from survey_insight.models import TextDocument
 from survey_insight.preprocessing import normalize_text
-from survey_insight.sentiment import analyze_text_sentiment
+from survey_insight.sentiment import (
+    aggregate_document_sentiment,
+    aggregate_topic_sentiment,
+    analyze_text_sentiment,
+    sentiment_payload,
+)
 
 
 # These sentences are written for this test suite; they contain no user data.
@@ -64,6 +71,21 @@ REVIEW_CASES = [
 
 
 class KoreanSentimentContextTests(unittest.TestCase):
+    def test_aggregate_preserves_review_count_for_texts_and_saved_documents(self) -> None:
+        texts = ["교육에 만족합니다.", "서비스가 좋다는 말에 동의하지 않습니다.", "친절하게 안내해 주세요."]
+        aggregate = aggregate_topic_sentiment(texts)
+        self.assertEqual(aggregate.count, 3)
+        self.assertEqual(aggregate.review_count, 2)
+        documents = [TextDocument(str(index), index, "text", text, text, {})
+                     for index, text in enumerate(texts)]
+        for document in documents:
+            document.sentiment = sentiment_payload(analyze_text_sentiment(document.redacted_text))
+        with patch("survey_insight.sentiment.analyze_text_sentiment", side_effect=AssertionError("use saved analysis")):
+            persisted = aggregate_document_sentiment(documents)
+        self.assertEqual(persisted.review_count, 2)
+        self.assertEqual(persisted.label_counts, aggregate.label_counts)
+        self.assertEqual(aggregate_topic_sentiment([]).review_count, 0)
+
     def test_authored_context_challenge(self) -> None:
         for text, expected in CONTEXT_CASES:
             with self.subTest(text=text):

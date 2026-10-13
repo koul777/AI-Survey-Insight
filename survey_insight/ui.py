@@ -1568,6 +1568,7 @@ def app_html() -> str:
             <span class="pill">${escapeHtml(sentimentMethodLabel(topic.sentiment_method))}</span>
           </div>
           <p>${escapeHtml(plain)}</p>
+          ${topic.sentiment_review_count ? `<p>감정 문맥 검토 필요 ${Number(topic.sentiment_review_count)}건 · 원문 확인 후 대응 방향을 정하세요.</p>` : ""}
           ${topic.sentiment_distribution && Object.keys(topic.sentiment_distribution).length ? `<p>응답별 사전 분석 분포</p>${sentimentCounts(topic.sentiment_distribution, topic.count)}` : ""}
           <div class="sentiment-bars">
             <div class="sentiment-meter">

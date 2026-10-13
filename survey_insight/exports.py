@@ -4,6 +4,7 @@ import html
 import json
 import re
 import zipfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,7 @@ def _write_assigned_rows(ws: Any, package: AnalysisPackage) -> None:
     headers = ["row_index", "redacted_text", "privacy_review_flags", "topic_id", "topic_label",
                "topic_tokens", "topic_exclusion_reason", "membership_score", "score_method", "needs_review",
                "sentiment_label", "sentiment_score", "sentiment_status", "sentiment_evidence", "sentiment_method",
+               "sentiment_needs_review", "review_reasons",
                "source_row_indices", "source_message_count", "source_row_mapping_status"] + package.group_columns
     _append_row(ws, headers)
     for doc in package.documents:
@@ -132,6 +134,8 @@ def _write_assigned_rows(ws: Any, package: AnalysisPackage) -> None:
                 sentiment.get("evidence_status", "not_analyzed"),
                 json.dumps(sentiment.get("evidence_spans", []), ensure_ascii=False),
                 sentiment.get("source", ""),
+                sentiment.get("needs_review"),
+                json.dumps(sentiment["review_reasons"], ensure_ascii=False) if "review_reasons" in sentiment else "미기록",
                 json.dumps(doc.metadata.get("_source_row_indices", [] if _is_chat_analysis(package) else [doc.row_index]), ensure_ascii=False),
                 doc.metadata.get("_source_message_count"),
                 "not_recorded" if _is_chat_analysis(package) and "_source_row_indices" not in doc.metadata else "recorded",
@@ -197,6 +201,10 @@ def _write_sentiment_summary(ws: Any, package: AnalysisPackage) -> None:
     _append_row(ws, ["analysis_unit", summary.get("analysis_unit", "response")])
     _append_row(ws, ["source_message_count", summary.get("source_message_count")])
     _append_row(ws, ["집계 단위 설명", _analysis_unit_note(package)])
+    review = _sentiment_review_details(package)
+    _append_row(ws, ["needs_review_count", review["count"] if review["count"] is not None else "미기록"])
+    _append_row(ws, ["review_reason_counts", json.dumps(review["reasons"], ensure_ascii=False) if review["reasons"] is not None else "미기록"])
+    _append_row(ws, ["감정 문맥 검토", _sentiment_review_note(package)])
     for key, value in summary.get("lexicon", {}).items():
         _append_row(ws, [f"lexicon.{key}", value])
     for key, value in package.recommendation.analysis_diagnostics.items():
@@ -330,6 +338,7 @@ def _ppt_summary_slide(prs: Presentation, package: AnalysisPackage) -> None:
          else f"권장 토픽 수는 {rec.topic_count}개이며 복합 평가값(휴리스틱)은 {rec.score:.2f}입니다."),
         f"분석 컬럼: {package.text_column}",
         f"사람 검토 상태: {_human_review(package).get('status', 'not_reviewed')}",
+        _sentiment_review_note(package),
     ]
     lines.extend(f"{label}: {value}" for label, value in _recommendation_explanations(package.recommendation))
     lines.extend(package.recommendation.warnings[:2])
@@ -340,7 +349,8 @@ def _ppt_summary_slide(prs: Presentation, package: AnalysisPackage) -> None:
 def _ppt_sentiment_slide(prs: Presentation, package: AnalysisPackage) -> None:
     slide = _ppt_blank_slide(prs, f"{_analysis_unit_label(package)}별 감정사전 집계")
     topics = package.selected_topics[:6]
-    table = slide.shapes.add_table(len(topics) + 1, 6, Inches(0.4), Inches(1.2), Inches(9.2), Inches(3.8)).table
+    _ppt_bullets(slide, [_sentiment_review_note(package)], left=0.4, top=1.0, width=9.2, height=0.5, font_size=12)
+    table = slide.shapes.add_table(len(topics) + 1, 6, Inches(0.4), Inches(1.55), Inches(9.2), Inches(3.45)).table
     headers = ["토픽", "긍정", "중립", "부정", "혼합", "근거 포함률"]
     for index, value in enumerate(headers):
         table.cell(0, index).text = value
@@ -465,6 +475,7 @@ def _document_xml(package: AnalysisPackage) -> str:
         )
     )
     body.append(_p(_analysis_unit_note(package)))
+    body.append(_p(_sentiment_review_note(package)))
     for label, value in _recommendation_explanations(package.recommendation):
         body.append(_heading(label, 2))
         body.append(_p(value))
@@ -564,6 +575,34 @@ def _sentiment_summary_with_units(package: AnalysisPackage) -> dict[str, Any]:
     chat = package.project.get("chat_preprocessing") or {}
     summary.setdefault("source_message_count", chat.get("retained_messages") if _is_chat_analysis(package) else None)
     return summary
+
+
+def _sentiment_review_details(package: AnalysisPackage) -> dict[str, Any]:
+    summary = package.recommendation.sentiment_summary
+    analyzed = [document.sentiment for document in package.documents
+                if not document.is_no_opinion and document.redacted_text]
+    recorded = [sentiment for sentiment in analyzed if "needs_review" in sentiment]
+    count = summary.get("needs_review_count")
+    missing = 0
+    if count is None:
+        count = sum(bool(sentiment["needs_review"]) for sentiment in recorded) if recorded else None
+        missing = len(analyzed) - len(recorded)
+    reasons = summary.get("review_reason_counts")
+    if reasons is None:
+        recorded_reasons = [sentiment["review_reasons"] for sentiment in analyzed if "review_reasons" in sentiment]
+        reasons = dict(Counter(reason for values in recorded_reasons for reason in values)) if recorded_reasons else None
+    return {"count": count, "reasons": reasons, "missing": missing}
+
+
+def _sentiment_review_note(package: AnalysisPackage) -> str:
+    review = _sentiment_review_details(package)
+    if review["count"] is None:
+        return "감정 문맥 검토 필요 건수: 미기록. 저장 결과에 검토 여부가 없습니다."
+    partial = f" (검토 여부 {review['missing']}건 미기록)" if review["missing"] else ""
+    note = f"감정 문맥 검토 필요 {review['count']}건{partial}."
+    if review["count"]:
+        note += " 감정 분포에는 인용·가정 등 문맥 확인이 필요한 판정도 포함됩니다."
+    return note
 
 
 def _analysis_unit_note(package: AnalysisPackage) -> str:

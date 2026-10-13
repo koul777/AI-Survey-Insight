@@ -99,6 +99,22 @@ class TopicNumericalQualityTests(unittest.TestCase):
 
 
 class TopicEvidenceIntegrationTests(unittest.TestCase):
+    def test_topic_review_count_restores_duplicate_response_frequency(self) -> None:
+        rows = [{"response": text} for text in [
+            "교육이 좋다는 말에 동의하지 않습니다.",
+            "교육이 좋다는 말에 동의하지 않습니다.",
+            "교육이 유익합니다.",
+        ]]
+        package = analyze_table(TableData(["response"], rows), text_column="response", group_columns=[])
+        self.assertEqual(sum(topic.count for topic in package.selected_topics), 3)
+        self.assertEqual(sum(topic.sentiment_review_count for topic in package.selected_topics), 2)
+        self.assertEqual(sum(bool(doc.sentiment.get("needs_review")) for doc in package.documents), 2)
+        for topic in package.selected_topics:
+            if topic.sentiment_review_count:
+                self.assertIn("문맥 검토", topic.suggested_action)
+                self.assertNotIn("확산", topic.suggested_action)
+                self.assertIn("확정하지", topic.sentiment_plain_language)
+
     def test_low_overlap_language_does_not_claim_reliable_topics(self) -> None:
         fixture = json.loads((Path(__file__).parent / "fixtures/topic_paraphrases.json").read_text(encoding="utf-8"))
         rows = [{"response": text} for texts in fixture["topics"].values() for text in texts]

@@ -51,6 +51,34 @@ def _package() -> AnalysisPackage:
 
 
 class AnalysisIntegrityTests(unittest.TestCase):
+    def test_exports_keep_sentiment_review_reasons_and_legacy_unknowns_visible(self) -> None:
+        for mode in ("documents", "summary", "unknown"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                package = _package()
+                if mode != "unknown":
+                    for index, document in enumerate(package.documents):
+                        document.sentiment["needs_review"] = index < 2
+                        document.sentiment["review_reasons"] = ["quoted_judgment"] if index < 2 else []
+                if mode == "summary":
+                    package.recommendation.sentiment_summary.update(
+                        needs_review_count=3, review_reason_counts={"hypothetical": 3})
+                workbook = load_workbook(export_excel(package, Path(tmp) / "review.xlsx"))
+                rows = list(workbook["원자료_토픽배정"].values)
+                flag = rows[1][rows[0].index("sentiment_needs_review")]
+                reasons = rows[1][rows[0].index("review_reasons")]
+                self.assertEqual(flag, None if mode == "unknown" else True)
+                self.assertEqual(reasons, "미기록" if mode == "unknown" else '["quoted_judgment"]')
+                summary_rows = list(workbook["감정분포"].values)
+                count = next(row[1] for row in summary_rows if row[0] == "needs_review_count")
+                expected = "미기록" if mode == "unknown" else (3 if mode == "summary" else 2)
+                self.assertEqual(count, expected)
+                reason_counts = next(row[1] for row in summary_rows if row[0] == "review_reason_counts")
+                self.assertIn("미기록" if mode == "unknown" else ("hypothetical" if mode == "summary" else "quoted_judgment"), reason_counts)
+                for exporter, suffix in ((export_word, "docx"), (export_powerpoint, "pptx")):
+                    with zipfile.ZipFile(exporter(package, Path(tmp) / f"review.{suffix}")) as archive:
+                        xml = " ".join(archive.read(name).decode("utf-8") for name in archive.namelist() if name.endswith(".xml"))
+                        self.assertIn("감정 문맥 검토 필요 건수: 미기록" if mode == "unknown" else f"감정 문맥 검토 필요 {expected}건", xml)
+
     def test_legacy_chat_units_are_recovered_on_read_without_rewriting_storage(self) -> None:
         package = _package()
         package.project["chat_preprocessing"] = {"retained_messages": 27, "context_segments": 9}
@@ -152,11 +180,13 @@ class AnalysisIntegrityTests(unittest.TestCase):
 
     def test_merge_preserves_source_examples_sentiment_and_combines_memberships(self) -> None:
         package = _package()
+        package.documents[0].sentiment["needs_review"] = True
         apply_edit(package, "merge_topics", {"source_topic_ids": ["T01", "T02"], "target_label": "병합"})
         topic = package.selected_topics[0]
         self.assertEqual(topic.count, 6)
         self.assertEqual(topic.sentiment_distribution, {"positive": 3, "neutral": 0, "negative": 3, "mixed": 0})
         self.assertEqual(topic.sentiment_method, "fixture_lexicon")
+        self.assertEqual(topic.sentiment_review_count, 1)
         self.assertIn("주제1 의견1", topic.representative_responses)
         self.assertIn("주제2 의견1", topic.representative_responses)
         self.assertTrue(topic.sentiment_plain_language)
@@ -166,6 +196,18 @@ class AnalysisIntegrityTests(unittest.TestCase):
             self.assertTrue(assignment.needs_review)
         self.assertEqual(package.assignments[-1].topic_id, "T03")
         self.assertEqual(package.assignments[-1].probability, 0.4)
+
+    def test_structural_edit_shares_use_only_remaining_assigned_topics(self) -> None:
+        package = _package()
+        package.documents.append(TextDocument("sentiment_only", 10, "response", "좋습니다", "좋습니다", {}))
+        package.assignments.append(TopicAssignment("sentiment_only", "OUTLIER", 0.0, True, "model"))
+        package.assignments.append(TopicAssignment("unknown_topic", "missing_topic", 0.0, False, "legacy"))
+        apply_edit(package, "merge_topics", {"source_topic_ids": ["T01", "T02"], "target_label": "병합"})
+        self.assertAlmostEqual(sum(topic.share for topic in package.selected_topics), 1.0)
+        self.assertEqual([topic.count for topic in package.selected_topics], [6, 3])
+        apply_edit(package, "exclude_topic", {"topic_id": "T03"})
+        self.assertEqual(package.selected_topics[0].share, 1.0)
+        self.assertIn("100.0%", package.selected_topics[0].plain_language_summary)
 
     def test_structural_edit_keeps_diagnostics_scoped_to_original_model(self) -> None:
         package = _package()

@@ -151,6 +151,11 @@ def _topic_summary(topic: Topic) -> str:
 
 
 def _topic_action(topic: Topic) -> str:
+    if topic.sentiment_review_count:
+        return (
+            f"이 토픽의 {topic.sentiment_review_count}건은 감정 문맥 검토가 필요합니다. "
+            "인용·가정·요청 여부와 실제 화자의 평가를 원문에서 먼저 확인한 뒤 대응 방향을 정하세요."
+        )
     if topic.urgency_score >= 0.5:
         return "처리 우선도 신호가 높으므로 담당 부서가 대표 의견을 먼저 읽고 단기 조치가 필요한 항목을 분리하세요."
     if topic.sentiment_label == "negative":
@@ -174,7 +179,11 @@ def _sentiment_summary(topic: Topic) -> str:
     distribution = topic.sentiment_distribution
     counts_text = (f" 응답별 긍정 {distribution.get('positive', 0)}건, 부정 {distribution.get('negative', 0)}건, "
                    f"혼합 {distribution.get('mixed', 0)}건, 중립 {distribution.get('neutral', 0)}건입니다.") if distribution else ""
-    return f"{label_text}{counts_text} 처리 우선도는 {topic.urgency_score:.2f}입니다.{evidence_text}"
+    review_text = (
+        f" 이 중 {topic.sentiment_review_count}건은 감정 문맥 검토가 필요하므로 실제 평가로 확정하지 마세요."
+        if topic.sentiment_review_count else ""
+    )
+    return f"{label_text}{counts_text}{review_text} 처리 우선도는 {topic.urgency_score:.2f}입니다.{evidence_text}"
 
 
 def _candidate_engine_summary(recommendation: Recommendation) -> str:

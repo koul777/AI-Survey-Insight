@@ -57,6 +57,7 @@ class TopicSentimentAggregate:
     evidence_terms: tuple[str, ...]
     source: str = SENTIMENT_METHOD
     evidence_coverage: float = 0.0
+    review_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -417,6 +418,7 @@ def _aggregate_payloads(results: Sequence[dict[str, Any]]) -> TopicSentimentAggr
         evidence_terms=tuple(dict.fromkeys(term for r in results for term in r["evidence_terms"])),
         source=source,
         evidence_coverage=round(sum(r.get("evidence_status") == "matched" for r in results) / max(1, count), 4),
+        review_count=sum(bool(result.get("needs_review")) for result in results),
     )
 
 

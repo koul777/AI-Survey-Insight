@@ -103,7 +103,7 @@ def _merge_topics(package: AnalysisPackage, source_topic_ids: list[str], target_
         for topic in merged:
             if rank < len(topic.representative_responses):
                 all_reps.append(mask_pii(topic.representative_responses[rank])[0])
-    document_ids = {a.document_id for a in package.assignments if a.topic_id in source_set}
+    document_ids = {a.document_id for a in package.assignments if a.topic_id in source_set and not a.is_outlier}
     sentiment = aggregate_document_sentiment([doc for doc in package.documents if doc.id in document_ids])
     replacement = Topic(
         topic_id=target_id,
@@ -120,6 +120,7 @@ def _merge_topics(package: AnalysisPackage, source_topic_ids: list[str], target_
         sentiment_method=sentiment.source,
         sentiment_distribution=sentiment.label_counts,
         sentiment_evidence_coverage=sentiment.evidence_coverage,
+        sentiment_review_count=sentiment.review_count,
     )
     apply_topic_explanation(replacement)
     package.selected_topics = [topic for topic in package.selected_topics if topic.topic_id not in source_set]
@@ -253,10 +254,13 @@ def _sync_selected_candidate(package: AnalysisPackage) -> None:
 
 
 def _recalculate_topic_shares(package: AnalysisPackage) -> None:
-    denominator = max(1, len(package.assignments))
+    selected_ids = {topic.topic_id for topic in package.selected_topics}
     counts: dict[str, int] = {}
     for assignment in package.assignments:
+        if assignment.is_outlier or assignment.topic_id not in selected_ids:
+            continue
         counts[assignment.topic_id] = counts.get(assignment.topic_id, 0) + 1
+    denominator = max(1, sum(counts.values()))
     for topic in package.selected_topics:
         topic.count = counts.get(topic.topic_id, 0)
         topic.share = round(topic.count / denominator, 4)
