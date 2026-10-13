@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.cell import Cell
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from pptx import Presentation
@@ -14,6 +16,7 @@ from pptx.enum.text import PP_ALIGN
 from pptx.util import Inches, Pt
 
 from .models import AnalysisPackage
+from .preprocessing import mask_pii
 
 
 METRIC_LABELS = {
@@ -91,6 +94,8 @@ def export_powerpoint(package: AnalysisPackage, path: str | Path) -> Path:
     _ppt_title_slide(prs, package)
     _ppt_summary_slide(prs, package)
     _ppt_topics_slide(prs, package)
+    if any(topic.sentiment_distribution for topic in package.selected_topics):
+        _ppt_sentiment_slide(prs, package)
     _ppt_representatives_slide(prs, package)
     _ppt_methodology_slide(prs, package)
     prs.save(target)
@@ -103,13 +108,14 @@ def _write_assigned_rows(ws: Any, package: AnalysisPackage) -> None:
     topic_label = {topic.topic_id: topic.label for topic in package.selected_topics}
     headers = ["row_index", "redacted_text", "privacy_review_flags", "topic_id", "topic_label",
                "topic_tokens", "topic_exclusion_reason", "membership_score", "score_method", "needs_review",
-               "sentiment_label", "sentiment_score", "sentiment_status", "sentiment_evidence", "sentiment_method"] + package.group_columns
-    ws.append(headers)
+               "sentiment_label", "sentiment_score", "sentiment_status", "sentiment_evidence", "sentiment_method",
+               "source_row_indices", "source_message_count", "source_row_mapping_status"] + package.group_columns
+    _append_row(ws, headers)
     for doc in package.documents:
         topic_id = assignment_by_doc.get(doc.id, "")
         assignment = assignments.get(doc.id)
         sentiment = doc.sentiment
-        ws.append(
+        _append_row(ws,
             [
                 doc.row_index,
                 doc.redacted_text,
@@ -126,13 +132,16 @@ def _write_assigned_rows(ws: Any, package: AnalysisPackage) -> None:
                 sentiment.get("evidence_status", "not_analyzed"),
                 json.dumps(sentiment.get("evidence_spans", []), ensure_ascii=False),
                 sentiment.get("source", ""),
+                json.dumps(doc.metadata.get("_source_row_indices", [] if _is_chat_analysis(package) else [doc.row_index]), ensure_ascii=False),
+                doc.metadata.get("_source_message_count"),
+                "not_recorded" if _is_chat_analysis(package) and "_source_row_indices" not in doc.metadata else "recorded",
                 *[doc.metadata.get(column) for column in package.group_columns],
             ]
         )
 
 
 def _write_topic_summary(ws: Any, package: AnalysisPackage) -> None:
-    ws.append([
+    _append_row(ws, [
         "topic_id",
         "label",
         "summary",
@@ -148,9 +157,10 @@ def _write_topic_summary(ws: Any, package: AnalysisPackage) -> None:
         "sentiment_method",
         "keywords",
         "positive_count", "neutral_count", "negative_count", "mixed_count", "sentiment_evidence_coverage",
+        "sentiment_distribution_method",
     ])
     for topic in package.selected_topics:
-        ws.append([
+        _append_row(ws, [
             topic.topic_id,
             topic.label,
             topic.summary,
@@ -167,98 +177,122 @@ def _write_topic_summary(ws: Any, package: AnalysisPackage) -> None:
             ", ".join(topic.keywords),
             *[topic.sentiment_distribution.get(label, 0) for label in ("positive", "neutral", "negative", "mixed")],
             topic.sentiment_evidence_coverage,
+            topic.sentiment_distribution_method,
         ])
 
 
 def _write_sentiment_summary(ws: Any, package: AnalysisPackage) -> None:
-    ws.append(["scope", "positive", "neutral", "negative", "mixed", "evidence_coverage", "analyzed_count"])
-    summary = package.recommendation.sentiment_summary
+    _append_row(ws, ["scope", "positive", "neutral", "negative", "mixed", "evidence_coverage", "analyzed_count", "distribution_method"])
+    summary = _sentiment_summary_with_units(package)
     counts = summary.get("label_counts", {})
-    ws.append(["전체 유효 응답", *[counts.get(label, 0) for label in ("positive", "neutral", "negative", "mixed")],
-               summary.get("evidence_coverage", 0), summary.get("analyzed_count", 0)])
+    _append_row(ws, [f"전체 유효 {_analysis_unit_label(package)}", *[counts.get(label, 0) for label in ("positive", "neutral", "negative", "mixed")],
+               summary.get("evidence_coverage", 0), summary.get("analyzed_count", 0), summary.get("source", "document_lexicon")])
     for topic in package.selected_topics:
-        ws.append([f"{topic.topic_id} {topic.label}",
+        _append_row(ws, [f"{topic.topic_id} {topic.label}",
                    *[topic.sentiment_distribution.get(label, 0) for label in ("positive", "neutral", "negative", "mixed")],
-                   topic.sentiment_evidence_coverage, topic.count])
-    ws.append([])
-    ws.append(["주의", "중립에는 사전 근거가 없는 응답이 포함됩니다. 근거 포함률을 함께 확인하세요."])
+                   topic.sentiment_evidence_coverage, sum(topic.sentiment_distribution.values()),
+                   topic.sentiment_distribution_method if topic.sentiment_distribution else "not_available_in_stored_result"])
+    _append_row(ws, [])
+    _append_row(ws, ["주의", "중립에는 사전 근거가 없는 응답이 포함됩니다. 근거 포함률을 함께 확인하세요."])
+    _append_row(ws, ["analysis_unit", summary.get("analysis_unit", "response")])
+    _append_row(ws, ["source_message_count", summary.get("source_message_count")])
+    _append_row(ws, ["집계 단위 설명", _analysis_unit_note(package)])
     for key, value in summary.get("lexicon", {}).items():
-        ws.append([f"lexicon.{key}", value])
+        _append_row(ws, [f"lexicon.{key}", value])
     for key, value in package.recommendation.analysis_diagnostics.items():
-        ws.append([f"preprocessing.{key}", json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value])
+        _append_row(ws, [f"preprocessing.{key}", json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value])
 
 
 def _write_representatives(ws: Any, package: AnalysisPackage) -> None:
-    ws.append(["topic_id", "topic_label", "rank", "representative_response"])
+    _append_row(ws, ["topic_id", "topic_label", "rank", "representative_response"])
     for topic in package.selected_topics:
         for idx, response in enumerate(topic.representative_responses, start=1):
-            ws.append([topic.topic_id, topic.label, idx, response])
+            _append_row(ws, [topic.topic_id, topic.label, idx, mask_pii(response)[0]])
 
 
 def _write_cross_analysis(ws: Any, package: AnalysisPackage) -> None:
-    ws.append(["group_column", "group_value", "topic_id", "topic_label", "display_count", "share", "suppressed",
+    _append_row(ws, ["group_column", "group_value", "topic_id", "topic_label", "display_count", "share", "suppressed",
                "positive_count", "neutral_count", "negative_count", "mixed_count"])
-    for row in package.cross_analysis:
-        ws.append(
+    if _is_chat_analysis(package):
+        _append_row(ws, ["주의", "대화 맥락에는 여러 작성자가 포함될 수 있어 작성자별 교차표는 내보내지 않습니다."])
+        return
+    for row in _export_cross_rows(package):
+        _append_row(ws,
             [
                 row.get("group_column"),
                 row.get("group_value"),
                 row.get("topic_id"),
                 row.get("topic_label"),
-                row.get("display_count"),
-                row.get("share"),
+                None if row.get("suppressed") else row.get("display_count"),
+                None if row.get("suppressed") else row.get("share"),
                 row.get("suppressed"),
-                *[(row.get("sentiment_counts") or {}).get(label) for label in ("positive", "neutral", "negative", "mixed")],
+                *[(row.get("sentiment_counts") or {}).get(label) if not row.get("suppressed") else None
+                  for label in ("positive", "neutral", "negative", "mixed")],
             ]
         )
 
 
 def _write_model_settings(ws: Any, package: AnalysisPackage) -> None:
     rec = package.recommendation
-    ws.append(["field", "value"])
-    ws.append(["mode", rec.mode])
-    ws.append(["valid_response_count", rec.valid_response_count])
-    ws.append(["allowed_topic_range", f"{rec.allowed_topic_range[0]}-{rec.allowed_topic_range[1]}"])
-    ws.append(["minimum_topic_size", rec.minimum_topic_size])
-    ws.append(["recommended_topic_count", rec.recommended.topic_count])
-    ws.append(["recommended_score (복합 평가값·휴리스틱)", rec.recommended.score])
-    ws.append(["analysis_seed", package.project.get("analysis_seed", 42)])
-    ws.append(["engine", rec.recommended.params.get("engine")])
-    ws.append(["feature_space", rec.recommended.params.get("feature_space")])
-    ws.append(["metric_profile", rec.recommended.params.get("metric_profile")])
-    ws.append(["quality_gate_passed", rec.recommended.params.get("quality_gate_passed")])
-    ws.append(["weight_sensitivity_profile", rec.recommended.params.get("weight_sensitivity_profile")])
-    ws.append(["weight_sensitivity_scenarios", rec.recommended.params.get("weight_sensitivity_scenarios")])
-    ws.append(["weight_multiplier_range", str(rec.recommended.params.get("weight_multiplier_range"))])
-    ws.append(["bootstrap_profile", rec.recommended.params.get("bootstrap_profile")])
-    ws.append(["bootstrap_repeats", rec.recommended.params.get("bootstrap_repeats")])
-    ws.append(["resampling_repeats", rec.recommended.params.get("resampling_repeats")])
+    _append_row(ws, ["field", "value"])
+    _append_row(ws, ["mode", rec.mode])
+    _append_row(ws, ["valid_response_count", rec.valid_response_count])
+    _append_row(ws, ["allowed_topic_range", f"{rec.allowed_topic_range[0]}-{rec.allowed_topic_range[1]}"])
+    _append_row(ws, ["minimum_topic_size", rec.minimum_topic_size])
+    _append_row(ws, ["recommended_topic_count", rec.recommended.topic_count])
+    _append_row(ws, ["recommended_score (복합 평가값·휴리스틱)", rec.recommended.score])
+    _append_row(ws, ["analysis_seed", package.project.get("analysis_seed", 42)])
+    _append_row(ws, ["engine", rec.recommended.params.get("engine")])
+    _append_row(ws, ["feature_space", rec.recommended.params.get("feature_space")])
+    _append_row(ws, ["metric_profile", rec.recommended.params.get("metric_profile")])
+    _append_row(ws, ["quality_gate_passed", rec.recommended.params.get("quality_gate_passed")])
+    _append_row(ws, ["diagnostics_status", rec.recommended.params.get("diagnostics_status", "original_model")])
+    _append_row(ws, ["metric_scope", "편집 전 원본 후보" if _has_structural_edits(package) else "현재 원본 후보"])
+    _append_row(ws, ["weight_sensitivity_profile", rec.recommended.params.get("weight_sensitivity_profile")])
+    _append_row(ws, ["weight_sensitivity_scenarios", rec.recommended.params.get("weight_sensitivity_scenarios")])
+    _append_row(ws, ["weight_multiplier_range", str(rec.recommended.params.get("weight_multiplier_range"))])
+    _append_row(ws, ["bootstrap_profile", rec.recommended.params.get("bootstrap_profile")])
+    _append_row(ws, ["bootstrap_repeats", rec.recommended.params.get("bootstrap_repeats")])
+    _append_row(ws, ["resampling_repeats", rec.recommended.params.get("resampling_repeats")])
     review = _human_review(package)
-    ws.append(["human_review.status", review.get("status")])
-    ws.append(["human_review.reviewer", review.get("reviewer", "")])
-    ws.append(["human_review.reviewed_at", review.get("reviewed_at", "")])
-    ws.append(["privacy_review_flag_count", package.project.get("privacy_review_flag_count", 0)])
+    _append_row(ws, ["human_review.status", review.get("status")])
+    _append_row(ws, ["human_review.reviewer", review.get("reviewer", "")])
+    _append_row(ws, ["human_review.reviewed_at", review.get("reviewed_at", "")])
+    _append_row(ws, ["privacy_review_flag_count", package.project.get("privacy_review_flag_count", 0)])
     for key, value in rec.recommended.metrics.items():
-        ws.append([f"metric.{key} ({METRIC_LABELS.get(key, key)})", value])
+        _append_row(ws, [f"metric.{key} ({METRIC_LABELS.get(key, key)})", value])
     for interval in rec.recommended.params.get("bootstrap_topic_share_intervals", []):
-        ws.append(
+        _append_row(ws,
             [
                 f"bootstrap.topic_share.{interval.get('topic_id')}",
                 f"estimate={interval.get('estimate')}, p025={interval.get('p025')}, p975={interval.get('p975')}",
             ]
         )
-    ws.append(["text_column", package.text_column])
-    ws.append(["methodology_note", package.methodology_note])
+    _append_row(ws, ["text_column", package.text_column])
+    _append_row(ws, ["methodology_note", package.methodology_note])
     for label, value in _recommendation_explanations(rec):
-        ws.append([label, value])
+        _append_row(ws, [label, value])
     for warning in rec.warnings:
-        ws.append(["warning", warning])
+        _append_row(ws, ["warning", warning])
 
 
 def _write_user_edits(ws: Any, package: AnalysisPackage) -> None:
-    ws.append(["timestamp", "user_id", "edit_type", "before", "after"])
+    _append_row(ws, ["timestamp", "user_id", "edit_type", "before", "after"])
     for edit in package.user_edits:
-        ws.append([edit.timestamp, edit.user_id, edit.edit_type, str(edit.before), str(edit.after)])
+        _append_row(ws, [edit.timestamp, edit.user_id, edit.edit_type,
+                         mask_pii(str(edit.before))[0], mask_pii(str(edit.after))[0]])
+
+
+def _append_row(ws: Any, values: list[Any]) -> None:
+    # OOXML text cannot contain these control characters. All text is explicitly
+    # stored as a string, including =formula and #N/A-like survey responses.
+    cells = []
+    for value in values:
+        cell = Cell(ws, value=_xml_text(value) if isinstance(value, str) else value)
+        if isinstance(value, str):
+            cell.data_type = "s"
+        cells.append(cell)
+    ws.append(cells)
 
 
 def _style_sheet(ws: Any) -> None:
@@ -282,7 +316,7 @@ def _ppt_title_slide(prs: Presentation, package: AnalysisPackage) -> None:
     subtitle = slide.placeholders[1]
     subtitle.text = (
         "AI 설문 자유응답 토픽모델링 분석\n"
-        f"{package.recommendation.mode} · 유효 응답 {package.recommendation.valid_response_count}건"
+        f"{package.recommendation.mode} · 유효 {_analysis_unit_label(package)} {package.recommendation.valid_response_count}건"
     )
 
 
@@ -290,8 +324,10 @@ def _ppt_summary_slide(prs: Presentation, package: AnalysisPackage) -> None:
     slide = _ppt_blank_slide(prs, "핵심 발견")
     rec = package.recommendation.recommended
     lines = [
-        f"총 응답 {package.dataset_profile.row_count}건 중 유효 자유응답 {package.recommendation.valid_response_count}건을 분석했습니다.",
-        f"권장 토픽 수는 {rec.topic_count}개이며 복합 평가값(휴리스틱)은 {rec.score:.2f}입니다.",
+        f"유효 {_analysis_unit_label(package)} {package.recommendation.valid_response_count}건을 분석했습니다.",
+        (f"사용자 편집 후 {rec.topic_count}개 토픽입니다. 편집 전 원본 평가값은 {rec.score:.2f}입니다."
+         if _has_structural_edits(package)
+         else f"권장 토픽 수는 {rec.topic_count}개이며 복합 평가값(휴리스틱)은 {rec.score:.2f}입니다."),
         f"분석 컬럼: {package.text_column}",
         f"사람 검토 상태: {_human_review(package).get('status', 'not_reviewed')}",
     ]
@@ -301,11 +337,30 @@ def _ppt_summary_slide(prs: Presentation, package: AnalysisPackage) -> None:
     _ppt_note(slide, package.methodology_note)
 
 
+def _ppt_sentiment_slide(prs: Presentation, package: AnalysisPackage) -> None:
+    slide = _ppt_blank_slide(prs, f"{_analysis_unit_label(package)}별 감정사전 집계")
+    topics = package.selected_topics[:6]
+    table = slide.shapes.add_table(len(topics) + 1, 6, Inches(0.4), Inches(1.2), Inches(9.2), Inches(3.8)).table
+    headers = ["토픽", "긍정", "중립", "부정", "혼합", "근거 포함률"]
+    for index, value in enumerate(headers):
+        table.cell(0, index).text = value
+        _ppt_cell_header(table.cell(0, index))
+    for index, topic in enumerate(topics, start=1):
+        values = [f"{topic.topic_id} {topic.label}",
+                  *[str(topic.sentiment_distribution.get(label, 0)) for label in ("positive", "neutral", "negative", "mixed")],
+                  f"{topic.sentiment_evidence_coverage:.0%}"]
+        for column, value in enumerate(values):
+            table.cell(index, column).text = value
+            _ppt_cell_body(table.cell(index, column), center=column > 0)
+    _ppt_bullets(slide, ["개별 분석 단위의 사전 판정을 합산했습니다. 토픽 요약 감정·외부 AI 해석과 구분해 읽습니다.",
+                         _analysis_unit_note(package)], left=0.4, top=5.1, width=9.2, height=1.35, font_size=12)
+
+
 def _ppt_topics_slide(prs: Presentation, package: AnalysisPackage) -> None:
     slide = _ppt_blank_slide(prs, "주요 토픽")
     rows = min(len(package.selected_topics), 6) + 1
     table = slide.shapes.add_table(rows, 6, Inches(0.25), Inches(1.25), Inches(9.5), Inches(4.4)).table
-    headers = ["토픽", "응답 수", "비율", "감정 신호/처리 우선도", "쉽게 읽는 해석", "대응 방안"]
+    headers = ["토픽", f"{_analysis_unit_label(package)} 수", "비율", "감정 신호/처리 우선도", "쉽게 읽는 해석", "대응 방안"]
     for idx, header in enumerate(headers):
         table.cell(0, idx).text = header
         _ppt_cell_header(table.cell(0, idx))
@@ -328,7 +383,7 @@ def _ppt_representatives_slide(prs: Presentation, package: AnalysisPackage) -> N
     bullets: list[str] = []
     for topic in package.selected_topics[:4]:
         if topic.representative_responses:
-            bullets.append(f"{topic.label}: {topic.representative_responses[0]}")
+            bullets.append(f"{topic.label}: {mask_pii(topic.representative_responses[0])[0]}")
     if not bullets:
         bullets.append("대표 의견을 생성할 유효 응답이 없습니다.")
     _ppt_bullets(slide, bullets, left=0.65, top=1.15, width=9.0, height=4.8)
@@ -359,7 +414,7 @@ def _ppt_blank_slide(prs: Presentation, title: str) -> Any:
     return slide
 
 
-def _ppt_bullets(slide: Any, lines: list[str], left: float, top: float, width: float, height: float) -> None:
+def _ppt_bullets(slide: Any, lines: list[str], left: float, top: float, width: float, height: float, font_size: int = 16) -> None:
     box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
     tf = box.text_frame
     tf.word_wrap = True
@@ -367,7 +422,7 @@ def _ppt_bullets(slide: Any, lines: list[str], left: float, top: float, width: f
         paragraph = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
         paragraph.text = line
         paragraph.level = 0
-        paragraph.font.size = Pt(16)
+        paragraph.font.size = Pt(font_size)
         paragraph.space_after = Pt(8)
 
 
@@ -405,21 +460,22 @@ def _document_xml(package: AnalysisPackage) -> str:
     body.append(
         _p(
             f"총 {package.dataset_profile.row_count}개 응답 중 "
-            f"{package.recommendation.valid_response_count}개의 유효 자유응답을 분석했습니다. "
-            f"권장 토픽 수는 {package.recommendation.recommended.topic_count}개입니다."
+            f"{package.recommendation.valid_response_count}개의 유효 {_analysis_unit_label(package)}을 분석했습니다. "
+            f"{'사용자 편집 후 표시' if _has_structural_edits(package) else '권장'} 토픽 수는 {package.recommendation.recommended.topic_count}개입니다."
         )
     )
+    body.append(_p(_analysis_unit_note(package)))
     for label, value in _recommendation_explanations(package.recommendation):
         body.append(_heading(label, 2))
         body.append(_p(value))
-    body.append(_heading("권장 근거", 1))
+    body.append(_heading("편집 전 원본 모델 진단" if _has_structural_edits(package) else "권장 근거", 1))
     rec = package.recommendation.recommended
     metric_rows = [["표시 지표", "내부 필드", "점수"]] + [
         [METRIC_LABELS.get(key, key), key, value] for key, value in rec.metrics.items()
     ]
     body.append(_table(metric_rows))
     body.append(_heading("주요 토픽", 1))
-    topic_rows = [["토픽", "응답 수", "비율", "감정 신호", "처리 우선도", "감정 방식", "키워드", "요약", "쉽게 읽는 해석", "대응 방안", "감정 해석"]]
+    topic_rows = [["토픽", f"{_analysis_unit_label(package)} 수", "비율", "감정 신호", "처리 우선도", "감정 방식", "키워드", "요약", "쉽게 읽는 해석", "대응 방안", "감정 해석"]]
     for topic in package.selected_topics:
         topic_rows.append(
             [
@@ -443,18 +499,19 @@ def _document_xml(package: AnalysisPackage) -> str:
         for label, value in _topic_plain_language_sections(topic):
             body.append(_p(f"{label}: {value}"))
         for response in topic.representative_responses:
-            body.append(_p(response, style="Quote"))
-    if package.cross_analysis:
+            body.append(_p(mask_pii(response)[0], style="Quote"))
+    cross_rows = _export_cross_rows(package)
+    if cross_rows:
         body.append(_heading("응답자 특성별 인사이트", 1))
         rows = [["그룹", "값", "토픽", "표시 건수", "비율"]]
-        for row in package.cross_analysis[:40]:
+        for row in cross_rows[:40]:
             rows.append(
                 [
                     str(row.get("group_column")),
                     str(row.get("group_value")),
                     str(row.get("topic_label")),
                     "숨김" if row.get("suppressed") else str(row.get("display_count")),
-                    f"{float(row.get('share') or 0):.1%}",
+                    "숨김" if row.get("suppressed") or row.get("share") is None else f"{float(row['share']):.1%}",
                 ]
             )
         body.append(_table(rows))
@@ -488,6 +545,49 @@ def _human_review(package: AnalysisPackage) -> dict[str, Any]:
     return {"status": "not_reviewed"}
 
 
+def _has_structural_edits(package: AnalysisPackage) -> bool:
+    return package.recommendation.recommended.params.get("diagnostics_status") == "invalidated_by_user_edit"
+
+
+def _analysis_unit_label(package: AnalysisPackage) -> str:
+    return "대화 맥락" if _is_chat_analysis(package) else "응답"
+
+
+def _is_chat_analysis(package: AnalysisPackage) -> bool:
+    analysis_unit = package.recommendation.sentiment_summary.get("analysis_unit")
+    return analysis_unit == "context_segment" or (analysis_unit is None and bool(package.project.get("chat_preprocessing")))
+
+
+def _sentiment_summary_with_units(package: AnalysisPackage) -> dict[str, Any]:
+    summary = dict(package.recommendation.sentiment_summary)
+    summary.setdefault("analysis_unit", "context_segment" if _is_chat_analysis(package) else "response")
+    chat = package.project.get("chat_preprocessing") or {}
+    summary.setdefault("source_message_count", chat.get("retained_messages") if _is_chat_analysis(package) else None)
+    return summary
+
+
+def _analysis_unit_note(package: AnalysisPackage) -> str:
+    if _is_chat_analysis(package):
+        missing_mapping = any("_source_row_indices" not in document.metadata for document in package.documents)
+        missing_note = " 이전 저장 결과에는 원본 행 위치가 기록되지 않았습니다." if missing_mapping else ""
+        return "건수는 메시지가 아닌 대화 맥락 단위입니다. 혼합 감정에는 서로 다른 발화자의 의견이 함께 포함될 수 있습니다. 작성자별 교차표는 생략합니다." + missing_note
+    return "감정 분포는 응답별 사전 판정 집계이며, 중립에는 사전 근거가 없는 응답도 포함됩니다."
+
+
+def _export_cross_rows(package: AnalysisPackage) -> list[dict[str, Any]]:
+    """Apply current display privacy to historical rows without changing them."""
+    if _is_chat_analysis(package):
+        return []
+    suppressed_groups = {
+        (row.get("group_column"), row.get("group_value"))
+        for row in package.cross_analysis if row.get("suppressed")
+    }
+    return [
+        {**row, "share": None if (row.get("group_column"), row.get("group_value")) in suppressed_groups else row.get("share")}
+        for row in package.cross_analysis
+    ]
+
+
 def _recommendation_explanations(rec: Any) -> list[tuple[str, str]]:
     recommended = getattr(rec, "recommended", None)
     entries = [
@@ -518,6 +618,10 @@ def _topic_plain_language_sections(topic: Any) -> list[tuple[str, str]]:
         ("쉽게 읽는 해석", _optional_text(topic, "plain_language_summary")),
         ("대응 방안", _optional_text(topic, "suggested_action")),
         ("감정 해석", _optional_text(topic, "sentiment_plain_language")),
+        ("응답별 감정 집계", ", ".join(
+            f"{label} {topic.sentiment_distribution.get(key, 0)}건"
+            for key, label in (("positive", "긍정"), ("neutral", "중립"), ("negative", "부정"), ("mixed", "혼합"))
+        ) + f" (방식: {topic.sentiment_distribution_method})" if topic.sentiment_distribution else "저장 결과에 응답별 감정 분포가 없습니다."),
     ]
     return [(label, value) for label, value in entries if value]
 
@@ -568,7 +672,11 @@ def _table(rows: list[list[Any]]) -> str:
 
 
 def _escape(value: Any) -> str:
-    return html.escape("" if value is None else str(value), quote=False)
+    return html.escape(_xml_text("" if value is None else str(value)), quote=False)
+
+
+def _xml_text(value: str) -> str:
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]", "", value)
 
 
 def _content_types_xml() -> str:

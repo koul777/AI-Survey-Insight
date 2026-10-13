@@ -93,7 +93,12 @@ def loads_json(value: str) -> Any:
 def from_jsonable(value: Any, target_type: type[Any] | Any) -> Any:
     """Rehydrate stored JSON into the app's dataclasses when callers need them."""
 
-    return _coerce_jsonable(value, target_type)
+    restored = _coerce_jsonable(value, target_type)
+    if isinstance(restored, AnalysisPackage):
+        restored.recommendation.sentiment_summary = _sentiment_summary_defaults(
+            restored.recommendation.sentiment_summary, restored.project.get("chat_preprocessing")
+        )
+    return restored
 
 
 class StorageRepository:
@@ -318,7 +323,8 @@ class StorageRepository:
         with self._connection() as conn:
             row = conn.execute(
                 """
-                SELECT json_extract(package_json, '$.recommendation') AS recommendation_json
+                SELECT json_extract(package_json, '$.recommendation') AS recommendation_json,
+                       json_extract(package_json, '$.project.chat_preprocessing') AS chat_preprocessing_json
                 FROM runs
                 WHERE run_id = ?
                 """,
@@ -327,7 +333,13 @@ class StorageRepository:
         if row is None or row["recommendation_json"] is None:
             return None
         value = loads_json(row["recommendation_json"])
-        return value if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            return None
+        chat_preprocessing = (
+            loads_json(row["chat_preprocessing_json"]) if row["chat_preprocessing_json"] is not None else None
+        )
+        value["sentiment_summary"] = _sentiment_summary_defaults(value.get("sentiment_summary"), chat_preprocessing)
+        return value
 
     def delete_run(self, run_id: str) -> RunDeleteResult:
         """Delete exactly one analysis run and report whether it existed."""
@@ -459,6 +471,15 @@ def _nested_get(value: Mapping[str, Any], *keys: str) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _sentiment_summary_defaults(summary: Any, chat_preprocessing: Any) -> dict[str, Any]:
+    """Recover known analysis units in memory; never invent historical row maps."""
+    result = dict(summary) if isinstance(summary, Mapping) else {}
+    is_chat = isinstance(chat_preprocessing, Mapping) and bool(chat_preprocessing)
+    result.setdefault("analysis_unit", "context_segment" if is_chat else "response")
+    result.setdefault("source_message_count", chat_preprocessing.get("retained_messages") if is_chat else None)
+    return result
 
 
 def _coerce_jsonable(value: Any, target_type: type[Any] | Any) -> Any:

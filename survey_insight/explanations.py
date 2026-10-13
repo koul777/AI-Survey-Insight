@@ -64,7 +64,7 @@ def _recommendation_summary(recommendation: Recommendation) -> str:
     review_required = rec.params.get("result_quality_status") == "review_required"
     weight_acceptability = rec.metrics.get("weight_acceptability")
     sensitivity_text = (
-        f" 가중치 변동 시나리오 선정률은 {weight_acceptability:.0%}였습니다."
+        f"가중치 변동 시나리오 선정률은 {weight_acceptability:.0%}였습니다. "
         if weight_acceptability is not None
         else ""
     )
@@ -82,7 +82,7 @@ def _recommendation_summary(recommendation: Recommendation) -> str:
         f"유효 자유응답 {recommendation.valid_response_count}건을 읽기 쉬운 묶음으로 나누어 보니 "
         f"{status_text}"
         f"{sensitivity_text}"
-        "토픽이 너무 적으면 서로 다른 의견이 섞이고, 너무 많으면 비슷한 이야기가 잘게 쪼개질 수 있어 "
+        "토픽이 너무 적으면 서로 다른 의견이 섞이고, 너무 많으면 비슷한 이야기가 잘게 쪼개질 수 있습니다. "
         f"{conclusion_text}"
     )
 
@@ -100,7 +100,7 @@ def _topic_count_explanation(recommendation: Recommendation) -> str:
     )
     return (
         f"허용 범위 {recommendation.allowed_topic_range[0]}-{recommendation.allowed_topic_range[1]}개 안에서 "
-        f"{engines}을 함께 비교했습니다. 토픽 수는 두 가지 관점으로 정했습니다. "
+        f"{engines}을 함께 비교했습니다. 토픽 수는 세 가지 관점으로 정했습니다. "
         "첫째, 키워드 동시출현, 군집 분리도, 포함률과 토픽 크기 균형을 결합한 휴리스틱 점수를 확인했습니다. "
         "둘째, 문서화된 가중치를 범위 안에서 바꾼 시나리오에서도 어떤 후보가 선택되는지 확인했습니다. "
         "셋째, 담당자가 실제로 읽고 이름을 붙일 수 있을 만큼 토픽이 너무 크거나 잘게 쪼개지지 않았는지 확인했습니다. "

@@ -324,7 +324,7 @@ def app_html() -> str:
     }
     .metrics {
       display: grid;
-      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr));
       gap: 11px;
       margin-bottom: 18px;
     }
@@ -448,7 +448,7 @@ def app_html() -> str:
     }
     .hero-insight {
       display: grid;
-      grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.2fr);
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
       gap: 14px;
       border: 1px solid rgba(23, 33, 43, 0.12);
       border-radius: 8px;
@@ -497,7 +497,7 @@ def app_html() -> str:
     }
     .decision-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
       gap: 10px;
     }
     .decision-card,
@@ -539,7 +539,7 @@ def app_html() -> str:
     }
     .score-grid {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
       gap: 10px;
       margin-top: 10px;
     }
@@ -1320,8 +1320,8 @@ def app_html() -> str:
       const detailed = rec.detailed ? `${rec.detailed.topic_count}개` : "-";
       $("recommendationSummary").innerHTML = [
         metric("모드", rec.mode),
-        metric("유효 응답", rec.valid_response_count),
-        metric("권장 토픽 수", `${rec.recommended.topic_count}개`),
+        metric(rec.sentiment_summary?.analysis_unit === "context_segment" ? "유효 맥락 구간" : "유효 응답", rec.valid_response_count),
+        metric(rec.recommended.params?.diagnostics_status === "invalidated_by_user_edit" ? "현재 토픽 수" : "권장 토픽 수", `${rec.recommended.topic_count}개`),
         metric("대안", `${wider} / ${detailed}`)
       ].join("");
       renderRecommendationExplanation(rec);
@@ -1329,14 +1329,14 @@ def app_html() -> str:
         <tr>
           <td>${candidate.rank}</td>
           <td>${candidate.topic_count}</td>
-          <td>${candidate.score}</td>
+          <td>${diagnosticValue(candidate, candidate.score)}</td>
           <td>${escapeHtml(candidate.params.engine)}</td>
           <td>${candidate.params.quality_gate_passed === true ? "통과" : (candidate.params.quality_gate_passed === false ? `보류: ${escapeHtml((candidate.params.quality_gate_reasons || []).join(" · "))}` : "이전 결과")}</td>
-          <td>${candidate.metrics.stability}</td>
-          <td>${candidate.metrics.coherence}</td>
-          <td>${candidate.metrics.semantic_quality}</td>
-          <td>${candidate.metrics.coverage}</td>
-          <td>${candidate.metrics.weight_acceptability ?? "-"}</td>
+          <td>${diagnosticValue(candidate, candidate.metrics.stability)}</td>
+          <td>${diagnosticValue(candidate, candidate.metrics.coherence)}</td>
+          <td>${diagnosticValue(candidate, candidate.metrics.semantic_quality)}</td>
+          <td>${diagnosticValue(candidate, candidate.metrics.coverage)}</td>
+          <td>${diagnosticValue(candidate, candidate.metrics.weight_acceptability)}</td>
         </tr>
       `).join("");
       const warnings = [...new Set([...(rec.warnings || []), ...(rec.quality_warnings || [])])]
@@ -1357,6 +1357,10 @@ def app_html() -> str:
       `;
     }
 
+    function diagnosticValue(candidate, value) {
+      return candidate.params?.diagnostics_status === "invalidated_by_user_edit" ? "편집 후 미평가" : escapeHtml(value ?? "—");
+    }
+
     function renderRecommendationExplanation(rec) {
       const recommended = rec.recommended || {};
       const topicCount = recommended.topic_count || 0;
@@ -1364,10 +1368,12 @@ def app_html() -> str:
       const reason = firstValue(rec, ["topic_count_explanation", "recommendation_reason", "topic_count_reason", "why_recommended"], firstValue(recommended, ["recommendation_reason", "topic_count_reason", "why_recommended"], ""));
       const warnings = [...new Set([...(rec.warnings || []), ...(rec.quality_warnings || [])])].filter(Boolean);
       const topics = recommended.topics || [];
-      const metrics = recommended.metrics || {};
+      const invalidated = recommended.params?.diagnostics_status === "invalidated_by_user_edit";
+      const metrics = invalidated ? {} : (recommended.metrics || {});
+      const analysisUnit = rec.sentiment_summary?.analysis_unit === "context_segment" ? "맥락 구간" : "응답";
       const engine = engineLabel((recommended.params || {}).engine || "unknown");
       const reviewRequired = (recommended.params || {}).result_quality_status === "review_required";
-      const recommendationLabel = reviewRequired ? "품질 검토 필요 후보" : "권장안";
+      const recommendationLabel = invalidated ? "사용자 편집안 · 미평가" : reviewRequired ? "품질 검토 필요 후보" : "권장안";
       const priorityTopics = [...topics]
         .sort((a, b) => priorityScore(b) - priorityScore(a));
       $("recommendationExplanation").innerHTML = `
@@ -1377,7 +1383,7 @@ def app_html() -> str:
               <p class="eyebrow">담당자가 먼저 볼 결론</p>
               <div class="hero-number"><strong>${escapeHtml(topicCount)}</strong><span>개 토픽</span></div>
               <div class="meta-line">
-                <span class="pill">유효 응답 ${escapeHtml(rec.valid_response_count)}건</span>
+                <span class="pill">유효 ${analysisUnit} ${escapeHtml(rec.valid_response_count)}건</span>
                 <span class="pill">${escapeHtml(engine)}</span>
                 <span class="pill">권장 범위 ${escapeHtml((rec.allowed_topic_range || []).join("-"))}개</span>
                 ${reviewRequired ? `<span class="pill warn">확정 사용 금지 · 재검토 필요</span>` : ""}
@@ -1391,7 +1397,7 @@ def app_html() -> str:
 
           <section class="decision-grid">
             ${decisionCard("wide", "더 적게 묶으면", rec.wider ? `${rec.wider.topic_count}개 대안` : "대안 없음", "서로 다른 의견이 한 바구니에 섞일 수 있어 담당 부서와 조치 방향을 나누기 어렵습니다.")}
-            ${decisionCard("recommended", recommendationLabel, `${topicCount}개`, reviewRequired ? "자동 품질 기준을 충족하지 못했습니다. 대표 응답과 다른 후보를 비교하기 전에는 확정값으로 사용하지 마세요." : "응답끼리는 비슷하게 묶이고 토픽끼리는 비교적 구분되어 담당자가 이름을 붙이고 읽기 쉬운 균형점입니다.")}
+            ${decisionCard("recommended", recommendationLabel, `${topicCount}개`, invalidated ? "사용자가 토픽 구성을 변경했습니다. 편집 후 품질은 다시 평가되지 않았으므로 대표 응답과 분포를 검토하세요." : reviewRequired ? "자동 품질 기준을 충족하지 못했습니다. 대표 응답과 다른 후보를 비교하기 전에는 확정값으로 사용하지 마세요." : "응답끼리는 비슷하게 묶이고 토픽끼리는 비교적 구분되어 담당자가 이름을 붙이고 읽기 쉬운 균형점입니다.")}
             ${decisionCard("detailed", "더 잘게 나누면", rec.detailed ? `${rec.detailed.topic_count}개 대안` : "대안 없음", "세부 차이는 더 보이지만 비슷한 이야기가 쪼개져 전체 흐름을 파악하기 어려울 수 있습니다.")}
           </section>
 
@@ -1399,11 +1405,12 @@ def app_html() -> str:
 
           <section class="dashboard-section">
             <p class="eyebrow">토픽 수를 정한 이유</p>
-            <h3>구조 관문·복합 평가·가중치 민감도·재표본 진단을 함께 봤습니다</h3>
+            <h3>${invalidated ? "사용자 편집 후 품질 점수는 다시 평가되지 않았습니다" : "구조 관문·복합 평가·가중치 민감도·재표본 진단을 함께 봤습니다"}</h3>
             <p>${escapeHtml(reason)}</p>
             <div class="score-grid">
               ${scoreCard("군집 품질 종합점수", metrics.stability, "분리도·키워드 동시출현·크기 균형을 결합한 휴리스틱이며 통계적 안정성이 아닙니다")}
-              ${scoreCard("토픽 해석 가능성 점수", metrics.coherence, "상위 키워드가 같은 문서에서 함께 나타나는 정도를 이용한 UMass 방식의 휴리스틱")}
+              ${scoreCard("토픽 해석 가능성 점수", metrics.coherence, "UMass 방식의 휴리스틱입니다. 드문 단어는 평활 때문에 높게 나올 수 있어 보정 진단과 함께 읽으세요")}
+              ${metrics.coherence_smoothed !== undefined ? scoreCard("희귀어 평활 보정 진단", metrics.coherence_smoothed, "단어쌍 동시출현에 0.5, 기준 단어 빈도에 1을 더한 보조 진단입니다. 복합 선정 점수에는 포함되지 않습니다") : ""}
               ${scoreCard("군집 분리도", metrics.semantic_quality, "노이즈 응답을 제외한 cosine silhouette의 음수를 0으로 제한한 값")}
               ${scoreCard("분석 포함률", metrics.coverage, "노이즈로 제외되지 않고 토픽에 배정된 유효 응답 비율")}
               ${scoreCard("토픽 키워드 다양성", metrics.diversity, "단어·구 포함 중복을 줄인 뒤 토픽별 상위 키워드가 서로 겹치지 않는 정도")}
@@ -1457,12 +1464,15 @@ def app_html() -> str:
       if (!count) return "";
       const diagnostics = rec.analysis_diagnostics || {};
       const lexicon = summary.lexicon || {};
+      const isChat = summary.analysis_unit === "context_segment";
       return `<section class="dashboard-section"><p class="eyebrow">전체 응답의 감정 분포</p>
-        <h3>토픽 분석과 함께 ${count}건의 감정을 분석했습니다</h3>
+        <h3>토픽 분석과 함께 ${count}개 ${isChat ? "맥락 구간" : "응답"}의 감정을 분석했습니다</h3>
+        ${isChat ? `<p>원문 메시지 ${Number(summary.source_message_count || 0)}개를 묶은 구간 기준입니다. 사람 수나 개별 메시지 수가 아니며, 혼합 감정에는 여러 발화자의 의견이 포함될 수 있습니다.</p>` : ""}
         ${sentimentCounts(summary.label_counts || {}, count)}
         <p>감정 근거 포함률 ${pct(summary.evidence_coverage)} · 사전 근거 없음 ${Number(summary.no_evidence_count || 0)}건. 중립에는 감정을 판단할 근거가 없는 응답도 포함됩니다.</p>
+        ${summary.needs_review_count !== undefined ? `<p>문맥 검토 필요 ${Number(summary.needs_review_count)}건. 응답별 근거에서 검토 사유를 확인할 수 있습니다.</p>` : ""}
         <details><summary>전처리·감정사전 확인</summary><p>${escapeHtml(diagnostics.tokenizer || "")} · 내장 감정사전 ${Number(lexicon.entry_count || 0)}항목 · v${escapeHtml(lexicon.version || "")}</p>
-        <p>무응답 ${Number(diagnostics.no_opinion_count || 0)}건 · 주제 단어 없음 ${Number(diagnostics.empty_topic_vocabulary_count || 0)}건 · 동일 문장 반복 ${Number(diagnostics.duplicate_response_count || 0)}건</p></details></section>`;
+        <p>규칙 버전 ${escapeHtml(lexicon.rules_version || "이전 버전")} · 무응답 ${Number(diagnostics.no_opinion_count || 0)}건 · 주제 단어 없음 ${Number(diagnostics.empty_topic_vocabulary_count || 0)}건 · 동일 문장 반복 ${Number(diagnostics.duplicate_response_count || 0)}건</p></details></section>`;
     }
 
     function sentimentCounts(counts, total) {
@@ -1491,7 +1501,10 @@ def app_html() -> str:
           const assignment = item.assignment || {};
           const evidence = (sentiment.evidence_spans || []).map(e => `${e.text}${e.negated ? " (부정 표현 반영)" : ""}`).join(" · ");
           const sentimentName = item.is_no_opinion ? "무응답 제외" : sentiment.polarity_label ? sentimentLabel(sentiment.polarity_label) : "미분석";
-          return `<tr><td>${Number(item.row_index)}<br>${escapeHtml(assignment.topic_id || "제외")}</td><td>${escapeHtml(item.redacted_text)}<br><small>${escapeHtml((item.topic_tokens || []).join(" · "))}</small></td><td>${escapeHtml(sentimentName)}${sentiment.needs_review ? " · 감정 검토 필요" : ""}<br>${escapeHtml(evidence || "사전 근거 없음")}</td><td>${assignment.probability !== undefined ? Number(assignment.probability).toFixed(2) : "—"}${assignment.needs_review ? " · 토픽 검토 필요" : ""}</td></tr>`;
+          const reviewReasons = (sentiment.review_reasons || []).map(sentimentReviewReason).join(" · ");
+          const sourceRows = item.source_row_indices || [];
+          const source = payload.analysis_unit === "context_segment" ? `구간 ${Number(item.row_index)}<br><small>${sourceRows.length ? `원본 행 ${escapeHtml(sourceRows.join(", "))}` : "이전 결과: 원본 행 미기록"}</small>` : Number(item.row_index);
+          return `<tr><td>${source}<br>${escapeHtml(assignment.topic_id || "제외")}</td><td>${escapeHtml(item.redacted_text)}<br><small>${escapeHtml((item.topic_tokens || []).join(" · "))}</small></td><td>${escapeHtml(sentimentName)}${sentiment.needs_review ? " · 감정 검토 필요" : ""}<br>${escapeHtml(evidence || "사전 근거 없음")}${reviewReasons ? `<br><small>${escapeHtml(reviewReasons)}</small>` : ""}</td><td>${assignment.probability !== undefined ? Number(assignment.probability).toFixed(2) : "—"}${assignment.needs_review ? " · 토픽 검토 필요" : ""}</td></tr>`;
         }).join("")}</tbody></table>` : `<p class="empty">선택한 조건에 해당하는 응답이 없습니다.</p>`;
         $("documentPage").textContent = `${payload.total ? offset + 1 : 0}–${Math.min(payload.total, offset + 25)} / ${payload.total}건 · 소속도는 정확도 확률이 아닙니다.`;
         $("documentPrev").disabled = offset === 0;
@@ -1501,7 +1514,12 @@ def app_html() -> str:
       }
     }
 
+    function sentimentReviewReason(code) {
+      return ({degraded_tokenizer: "형태소 대체 분석", quoted_judgment: "인용된 평가", uncertain_or_question: "의문·판단 유보", possible_irony: "반어 가능성", no_dictionary_evidence: "감정사전 근거 없음", hypothetical: "가정·조건 표현", desired_state: "희망·요청 상태", reported_proposition: "간접화법 평가"})[code] || code;
+    }
+
     function scoreCard(label, value, description) {
+      if (value === undefined || value === null) return `<article class="score-card"><div class="score-head"><span>${escapeHtml(label)}</span><span>미평가</span></div><p>${escapeHtml(description)}</p></article>`;
       const score = Math.max(0, Math.min(1, Number(value) || 0));
       return `
         <article class="score-card">

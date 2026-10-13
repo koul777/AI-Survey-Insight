@@ -20,7 +20,7 @@ from .profiling import profile_table
 from .storage import StorageRepository
 from .ui import app_html
 
-app = FastAPI(title="AI Survey Insight", version="0.2.0")
+app = FastAPI(title="AI Survey Insight", version="0.2.1")
 
 _TABLES: dict[str, TableData] = {}
 _PROFILES: dict[str, DatasetProfile] = {}
@@ -235,6 +235,10 @@ def get_run_documents(
             continue
         rows.append({
             "document_id": document.id, "row_index": document.row_index,
+            "source_row_indices": document.metadata.get(
+                "_source_row_indices", [] if package.project.get("chat_preprocessing") else [document.row_index]
+            ),
+            "source_message_count": document.metadata.get("_source_message_count"),
             "redacted_text": document.redacted_text,
             "topic_tokens": document.topic_tokens,
             "is_no_opinion": document.is_no_opinion,
@@ -242,7 +246,8 @@ def get_run_documents(
             "sentiment": document.sentiment,
             "assignment": to_jsonable(assignment),
         })
-    return {"total": total, "offset": offset, "limit": limit, "items": rows}
+    return {"total": total, "offset": offset, "limit": limit, "items": rows,
+            "analysis_unit": "context_segment" if package.project.get("chat_preprocessing") else "response"}
 
 
 @app.delete("/model-runs/{run_id}")

@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-13
+
+### Fixed
+
+- 간접 부정·후행 부정·해결 요청·중립 명사 문맥의 감정 오판을 수정하고 문맥 검토 사유와 규칙 버전을 기록합니다.
+- NMF 성분 배율에 따른 배정·소속도 변화를 제거하고, 부분표본에서 MiniBatch 알고리즘을 유지합니다. LDA 최소 단어 판정에서 bigram 중복 계수를 수정합니다.
+- 짧은 실질 대화 보존, 정규화된 반응 제거, 원본 데이터 행 추적과 맥락 단위 표시를 추가합니다.
+- 토픽 병합·제외 후 소속도·설명을 갱신하고 편집 전 모델 점수를 현재 품질로 표시하지 않습니다.
+- Excel 수식 해석, 대표 의견·편집 이력 마스킹 누락, 소수 집단 셀 및 비율을 통한 값 노출을 보완합니다.
+- 구버전 대화 결과의 분석 단위를 읽을 때 복원하고 원본 행 미기록을 추정하지 않습니다.
+
+### Added
+
+- 기존 선정식과 분리한 희귀어 평활 보정 진단 `coherence_smoothed`.
+- 감정 문맥·토픽 계산·저장/편집/보고서 무결성 회귀 및 다양한 표현의 토픽 진단 자료.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added
@@ -40,6 +56,7 @@
 - SQLite 기반 로컬 dataset 및 분석 run 저장
 - mock·합성 데이터 기반 unittest
 
-[Unreleased]: https://github.com/koul777/AI-Survey-Insight/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/koul777/AI-Survey-Insight/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/koul777/AI-Survey-Insight/releases/tag/v0.2.1
 [0.2.0]: https://github.com/koul777/AI-Survey-Insight/releases/tag/v0.2.0
 [0.1.0]: https://github.com/koul777/AI-Survey-Insight/releases/tag/v0.1.0
