@@ -1,0 +1,2 @@
+# Keep dictionary bytes stable for recorded SHA-256 provenance on Windows/Linux.
+*.tsv text eol=lf

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from dataclasses import dataclass
+from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
+from threading import RLock
 from typing import Any
 
 from .models import TextDocument, new_id
@@ -44,10 +49,39 @@ STOPWORDS = {
     "해서",
     "너무",
     "정말",
+    # 짧은 메신저 대화에서 주제를 가리지 못하는 지시어·맞장구 표현
+    "이거",
+    "그거",
+    "저거",
+    "이것",
+    "그것",
+    "저것",
+    "이게",
+    "그게",
+    "저게",
+    "저도",
+    "저희",
+    "근데",
+    "필요", "요청", "부분", "경우", "생각", "정도", "때문", "이번", "현재",
+    "만족", "불만", "불만족", "불편", "부족", "친절", "유익", "유용",
+    "도움", "문제", "아쉬움", "감사", "실망",
 }
 
 _TOKENIZER_BACKEND: Any | None = None
 _TOKENIZER_SOURCE = ""
+_TOKENIZER_LOCK = RLock()
+_PLACEHOLDER = re.compile(r"\[(?:EMAIL|PHONE|EMPLOYEE_ID)\]", re.I)
+_URL = re.compile(r"https?://\S+|www\.\S+", re.I)
+_SINGLE_NOUNS = {"앱", "일", "밥", "돈", "집", "몸", "차", "책", "법", "병", "휴"}
+
+
+@dataclass(frozen=True)
+class Morpheme:
+    form: str
+    tag: str
+    start: int
+    end: int
+    sentence: int = 0
 
 PII_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[EMAIL]"),
@@ -72,6 +106,10 @@ PRIVACY_REVIEW_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 def normalize_text(value: Any) -> str:
     text = "" if value is None else str(value)
+    if isinstance(value, float) and value != value:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -81,7 +119,8 @@ def normalize_text(value: Any) -> str:
 def is_no_opinion(value: Any) -> bool:
     text = normalize_text(value).lower()
     text = re.sub(r"\s+", " ", text)
-    return text in NO_OPINION_VALUES
+    text = text.strip(" .!?~。！")
+    return text in NO_OPINION_VALUES or bool(re.fullmatch(r"(?:의견|특이\s*사항|건의\s*사항)\s*(?:이\s*)?없(?:음|습니다|어요|다)", text))
 
 
 def mask_pii(text: str) -> tuple[str, list[str]]:
@@ -136,13 +175,11 @@ def valid_documents(documents: list[TextDocument]) -> list[TextDocument]:
 
 
 def tokenize_keywords(text: str) -> list[str]:
-    tokenizer = _get_tokenizer_backend()
-    if tokenizer[0].startswith("kiwi"):
-        tokens = _kiwi_nouns(tokenizer[1], text)
-    elif tokenizer[0].startswith("konlpy_okt"):
-        tokens = _okt_nouns(tokenizer[1], text)
-    else:
-        tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", normalize_text(text).lower())
+    # Topic vocabulary describes subjects. Sentiment uses the full POS stream
+    # separately so adjectives and negation do not disappear from its input.
+    cleaned_text = _URL.sub(" ", _PLACEHOLDER.sub(" ", normalize_text(text)))
+    tokens = [token.form for token in analyze_morphemes(cleaned_text)
+              if token.tag in {"NNG", "NNP", "SL", "XR", "UNKNOWN"}]
     cleaned: list[str] = []
     for token in tokens:
         normalized = normalize_text(token).lower()
@@ -150,7 +187,7 @@ def tokenize_keywords(text: str) -> list[str]:
             continue
         if normalized.isdigit():
             continue
-        if len(normalized) < 2:
+        if len(normalized) < 2 and normalized not in _SINGLE_NOUNS:
             continue
         cleaned.append(normalized)
     return cleaned
@@ -161,13 +198,18 @@ def tokenizer_source() -> str:
 
 
 def _get_tokenizer_backend() -> tuple[str, Any | None]:
+    with _TOKENIZER_LOCK:
+        return _initialize_tokenizer()
+
+
+def _initialize_tokenizer() -> tuple[str, Any | None]:
     global _TOKENIZER_BACKEND, _TOKENIZER_SOURCE
     if _TOKENIZER_SOURCE:
         return _TOKENIZER_SOURCE, _TOKENIZER_BACKEND
     try:
         from kiwipiepy import Kiwi  # type: ignore
 
-        _TOKENIZER_BACKEND = Kiwi()
+        _TOKENIZER_BACKEND = Kiwi(num_workers=2)
         _TOKENIZER_SOURCE = "kiwi_noun_extractor"
         return _TOKENIZER_SOURCE, _TOKENIZER_BACKEND
     except Exception:
@@ -184,6 +226,52 @@ def _get_tokenizer_backend() -> tuple[str, Any | None]:
         return _TOKENIZER_SOURCE, _TOKENIZER_BACKEND
 
 
+@lru_cache(maxsize=4096)
+def analyze_morphemes(text: str) -> tuple[Morpheme, ...]:
+    """Immutable POS/lemma stream; offsets refer to the normalized input.
+
+    A bounded in-process cache shares expensive Korean parsing across model
+    candidates. No raw text or cache is written to disk.
+    """
+    text = normalize_text(text)
+    source, backend = _get_tokenizer_backend()
+    if source.startswith("kiwi"):
+        return tuple(Morpheme(str(t.form).lower(), str(t.tag).split("-")[0],
+                              int(t.start), int(t.start + t.len), int(t.sent_position))
+                     for t in backend.tokenize(text, normalize_coda=True, split_complex=True))
+    if source.startswith("konlpy_okt"):
+        # Okt does not provide reliable character spans; use the conservative
+        # lexical fallback for sentiment and preserve its noun extraction.
+        nouns = set(backend.nouns(text))
+    else:
+        nouns = set()
+    return tuple(Morpheme(m.group().lower(), "NNG" if m.group() in nouns else "UNKNOWN",
+                          m.start(), m.end())
+                 for m in re.finditer(r"[가-힣A-Za-z]+|[.!?;\n]", text))
+
+
+def preprocessing_diagnostics(documents: list[TextDocument]) -> dict[str, Any]:
+    valid = valid_documents(documents)
+    counts = [len(tokenize_keywords(doc.redacted_text)) for doc in valid]
+    versions = {}
+    for package in ("kiwipiepy", "kiwipiepy_model", "scikit-learn", "numpy"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = "unavailable"
+    return {
+        "library_versions": versions,
+        "tokenizer": tokenizer_source(),
+        "normalization": "NFKC, zero-width removal, whitespace, Kiwi normalize_coda + split_complex",
+        "topic_pos": ["NNG", "NNP", "SL", "XR"],
+        "sentiment_pos": "full morphology with negation and clause boundaries",
+        "input_count": len(documents),
+        "no_opinion_count": len(documents) - len(valid),
+        "empty_topic_vocabulary_count": sum(count == 0 for count in counts),
+        "duplicate_response_count": len(valid) - len({doc.redacted_text for doc in valid}),
+        "topic_token_count": sum(counts),
+        "degraded": not tokenizer_source().startswith("kiwi"),
+    }
 def _kiwi_nouns(kiwi: Any, text: str) -> list[str]:
     nouns: list[str] = []
     for token in kiwi.tokenize(normalize_text(text)):

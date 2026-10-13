@@ -20,9 +20,11 @@ HEADER_TEXT_KEYWORDS = {
     "comment",
     "comments",
     "feedback",
+    "response",
     "opinion",
     "suggestion",
     "free text",
+    "메시지",
 }
 IDENTIFIER_KEYWORDS = {"id", "email", "e-mail", "이메일", "사번", "직번", "참여자", "성명", "이름", "전화"}
 TIME_KEYWORDS = {"일시", "시간", "응답일", "제출", "timestamp", "date", "time"}

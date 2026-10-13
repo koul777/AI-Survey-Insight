@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import sys
+import types
 import unittest
 import warnings
 import zipfile
@@ -30,13 +32,16 @@ from survey_insight.topics import (
     _attach_assignment_bootstrap,
     _attach_weight_sensitivity,
     _build_candidates,
+    _build_bertopic_candidate,
     _class_tfidf_scores,
     _cluster,
     _coherence,
     _count_vectorize,
     _fit_nmf,
     _lda_input_diagnostics,
+    _prefer_bertopic_candidate,
     _select_distinct_keywords,
+    _topic_counts_for_analysis,
     _silhouette,
     _select_recommended,
     topic_policy,
@@ -44,6 +49,120 @@ from survey_insight.topics import (
 
 
 class PipelineTests(unittest.TestCase):
+    def test_chat_prefers_valid_bertopic_when_separation_is_materially_better(self) -> None:
+        current = CandidateSolution(
+            candidate_id="nmf",
+            topic_count=4,
+            params={"engine": "nmf", "quality_gate_passed": True},
+            metrics={"semantic_quality": 0.01, "coverage": 1.0},
+            score=0.55,
+        )
+        bertopic = CandidateSolution(
+            candidate_id="bertopic",
+            topic_count=9,
+            params={"engine": "bertopic", "quality_gate_passed": True},
+            metrics={"semantic_quality": 0.13, "coverage": 0.77},
+            score=0.48,
+        )
+
+        selected, warning = _prefer_bertopic_candidate([current, bertopic], current)
+
+        self.assertIs(selected, bertopic)
+        self.assertIn("BERTopic", warning or "")
+
+    def test_bertopic_candidate_uses_precomputed_embeddings(self) -> None:
+        class FakeBERTopic:
+            last_kwargs: dict[str, object] = {}
+
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                FakeBERTopic.last_kwargs = kwargs
+
+            def fit_transform(self, texts: list[str], embeddings: np.ndarray) -> tuple[list[int], None]:
+                self.assertions = (texts, embeddings)
+                return ([0] * 10) + ([1] * 10), None
+
+        class FakeComponent:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        fake_bertopic = types.ModuleType("bertopic")
+        fake_bertopic.BERTopic = FakeBERTopic  # type: ignore[attr-defined]
+        fake_hdbscan = types.ModuleType("hdbscan")
+        fake_hdbscan.HDBSCAN = FakeComponent  # type: ignore[attr-defined]
+        fake_umap = types.ModuleType("umap")
+        fake_umap.UMAP = FakeComponent  # type: ignore[attr-defined]
+        texts = [f"공공 데이터 활용 정책 문서 {index}" for index in range(10)] + [
+            f"직원 교육 운영 개선 의견 {index}" for index in range(10)
+        ]
+        documents = [
+            TextDocument(
+                id=f"doc-{index}",
+                row_index=index,
+                text_column="response",
+                original_text=text,
+                redacted_text=text,
+                metadata={},
+            )
+            for index, text in enumerate(texts)
+        ]
+        vectorizer = CountVectorizer(token_pattern=r"(?u)\b\w+\b")
+        matrix = vectorizer.fit_transform(texts)
+        embeddings = np.vstack(
+            [np.tile([1.0, 0.0], (10, 1)), np.tile([0.0, 1.0], (10, 1))]
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"bertopic": fake_bertopic, "hdbscan": fake_hdbscan, "umap": fake_umap},
+        ):
+            candidate = _build_bertopic_candidate(
+                documents,
+                vectorizer,
+                matrix,
+                embeddings,
+                (2, 3),
+                min_topic_size=5,
+                seed=42,
+                embedding_source="test_embeddings",
+                embedding_model="test-model",
+            )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.params["engine"], "bertopic")
+        self.assertEqual(candidate.topic_count, 2)
+        self.assertEqual(candidate.params["embedding_source"], "test_embeddings")
+        self.assertEqual(FakeBERTopic.last_kwargs["language"], "multilingual")
+        self.assertEqual(FakeBERTopic.last_kwargs["nr_topics"], 3)
+
+    def test_large_dataset_topic_count_grid_is_bounded_and_keeps_range_edges(self) -> None:
+        for bounds in ((1, 30), (10, 30)):
+            counts = _topic_counts_for_analysis(47_709, bounds)
+            self.assertLessEqual(len(counts), 8)
+            self.assertEqual((counts[0], counts[-1]), bounds)
+            self.assertEqual(counts, sorted(set(counts)))
+        self.assertTrue({1, 2, 3}.issubset(_topic_counts_for_analysis(47_709, (1, 30))))
+        self.assertEqual(_topic_counts_for_analysis(100, (4, 10)), list(range(4, 11)))
+
+    def test_minibatch_nmf_recovers_large_sparse_topic_structure(self) -> None:
+        from scipy.sparse import csr_matrix
+        from sklearn.metrics import adjusted_rand_score
+
+        # 6,000 observations with three disjoint word groups. This exercises
+        # the real large-corpus solver, including its document-topic weights.
+        labels = np.repeat(np.arange(3), 2000)
+        rows = np.repeat(np.arange(len(labels)), 3)
+        columns = np.concatenate([np.arange(label * 3, label * 3 + 3) for label in labels])
+        matrix = csr_matrix((np.ones(len(rows)), (rows, columns)), shape=(6000, 9))
+        solution = _fit_nmf(matrix, 3, seed=42)
+        self.assertIsNotNone(solution)
+        actual, weights, components = solution
+        self.assertGreater(adjusted_rand_score(labels, actual), 0.99)
+        self.assertEqual(weights.shape, (6000, 3))
+        self.assertEqual(components.shape, (3, 9))
+        self.assertTrue(np.isfinite(weights).all())
+
     def test_distinct_keyword_selection_removes_word_ngram_containment(self) -> None:
         features = np.asarray(["캠페인", "성과", "캠페인 성과", "교육", "지원", "문화", "보상"])
         scores = np.asarray([0.9, 0.8, 1.0, 0.7, 0.6, 0.5, 0.4])
@@ -163,7 +282,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(package.recommendation.mode, "소표본 모드")
             self.assertGreaterEqual(package.recommendation.recommended.topic_count, 2)
             self.assertLessEqual(package.recommendation.recommended.topic_count, 4)
-            self.assertIsNotNone(package.recommendation.detailed)
+            self.assertTrue(package.recommendation.wider or package.recommendation.detailed)
             engines = {candidate.params["engine"] for candidate in package.recommendation.candidates}
             self.assertIn("kmeans", engines)
             self.assertIn("nmf", engines)
@@ -200,7 +319,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(package.recommendation.methodology_plain_language)
             self.assertTrue(package.recommendation.quality_warnings)
             self.assertIn("tokenizer", package.recommendation.recommended.params)
-            self.assertEqual(package.selected_topics[0].sentiment_method, "rule_lexicon_fallback")
+            self.assertEqual(package.selected_topics[0].sentiment_method, "korean_morph_lexicon_v1")
             self.assertTrue(package.selected_topics[0].plain_language_summary)
             self.assertTrue(package.selected_topics[0].suggested_action)
             self.assertTrue(package.selected_topics[0].sentiment_plain_language)

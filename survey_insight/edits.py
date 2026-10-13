@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any
 
 from .models import AnalysisPackage, Topic, UserEdit, utc_now
+from .sentiment import aggregate_document_sentiment
 
 
 def apply_edit(package: AnalysisPackage, edit_type: str, payload: dict[str, Any], user_id: str = "system") -> UserEdit:
@@ -22,6 +23,11 @@ def apply_edit(package: AnalysisPackage, edit_type: str, payload: dict[str, Any]
         raise ValueError(f"Unsupported edit_type: {edit_type}")
     if edit_type != "record_review":
         _mark_review_pending(package)
+    if edit_type in {"merge_topics", "exclude_topic"}:
+        from .pipeline import build_cross_analysis
+
+        package.cross_analysis = build_cross_analysis(package.documents, package.assignments,
+                                                      package.selected_topics, package.group_columns)
     _sync_selected_candidate(package)
     after = _snapshot(package)
     edit = UserEdit(edit_type=edit_type, before=before, after=after, user_id=user_id)
@@ -58,14 +64,16 @@ def _merge_topics(package: AnalysisPackage, source_topic_ids: list[str], target_
     target_id = source_topic_ids[0]
     source_set = set(source_topic_ids)
     merged = [topic for topic in package.selected_topics if topic.topic_id in source_set]
-    if not merged:
-        raise ValueError(f"No topics found for merge: {source_topic_ids}")
+    if len(source_set) != len(source_topic_ids) or len(merged) != len(source_set):
+        raise ValueError("merge_topics requires distinct existing topic IDs")
     total = sum(topic.count for topic in merged)
     all_keywords: list[str] = []
     all_reps: list[str] = []
     for topic in merged:
         all_keywords.extend(topic.keywords)
         all_reps.extend(topic.representative_responses)
+    document_ids = {a.document_id for a in package.assignments if a.topic_id in source_set}
+    sentiment = aggregate_document_sentiment([doc for doc in package.documents if doc.id in document_ids])
     replacement = Topic(
         topic_id=target_id,
         label=target_label,
@@ -74,14 +82,27 @@ def _merge_topics(package: AnalysisPackage, source_topic_ids: list[str], target_
         share=round(total / max(1, len(package.assignments)), 4),
         keywords=list(dict.fromkeys(all_keywords))[:8],
         representative_responses=list(dict.fromkeys(all_reps))[:3],
+        sentiment_label=sentiment.dominant_label,
+        sentiment_score=sentiment.average_polarity_score,
+        urgency_score=sentiment.average_urgency_score,
+        sentiment_evidence=list(sentiment.evidence_terms),
+        sentiment_method=sentiment.source,
+        sentiment_distribution=sentiment.label_counts,
+        sentiment_evidence_coverage=sentiment.evidence_coverage,
     )
     package.selected_topics = [topic for topic in package.selected_topics if topic.topic_id not in source_set]
     package.selected_topics.append(replacement)
     package.selected_topics.sort(key=lambda topic: topic.topic_id)
     for assignment in package.assignments:
+        combined_membership = sum(assignment.membership_scores.pop(source_id, 0.0) for source_id in source_set)
+        if combined_membership:
+            assignment.membership_scores[target_id] = round(combined_membership, 6)
         if assignment.topic_id in source_set:
             assignment.topic_id = target_id
             assignment.assignment_source = "user_edit"
+            assignment.probability = assignment.membership_scores.get(target_id, assignment.probability)
+            assignment.score_method = "merged_model_membership"
+            assignment.needs_review = True
     for row in package.cross_analysis:
         if row.get("topic_id") in source_set:
             row["topic_id"] = target_id

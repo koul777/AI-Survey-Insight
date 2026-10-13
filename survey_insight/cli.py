@@ -23,6 +23,8 @@ def main() -> None:
     analyze.add_argument("--text-column")
     analyze.add_argument("--group-column", action="append", default=[])
     analyze.add_argument("--seed", type=int, default=42, help="Random seed for reproducible local models")
+    analyze.add_argument("--local-embeddings", action="store_true", help="Use the installed offline multilingual E5 model")
+    sub.add_parser("setup-local-model", help="Download multilingual E5 once for offline semantic topic analysis")
     evaluate = sub.add_parser("evaluate-sentiment", help="Evaluate local sentiment with a labeled CSV")
     evaluate.add_argument("--input", required=True, help="UTF-8 CSV containing text and gold labels")
     evaluate.add_argument("--text-column", required=True)
@@ -33,6 +35,9 @@ def main() -> None:
         _analyze(args)
     elif args.command == "evaluate-sentiment":
         _evaluate_sentiment(args)
+    elif args.command == "setup-local-model":
+        from .local_embeddings import download_local_model
+        print(f"Local model installed: {download_local_model()}")
     else:
         _demo(args)
 
@@ -60,6 +65,7 @@ def _analyze(args: argparse.Namespace) -> None:
         text_column=args.text_column,
         group_columns=args.group_column or None,
         seed=args.seed,
+        local_embeddings=args.local_embeddings,
     )
     _write_outputs(package, out_dir)
     print(f"Analysis package: {out_dir / 'analysis_package.json'}")

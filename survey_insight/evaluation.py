@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .sentiment import POLARITY_LABELS, analyze_text_sentiment
+from .sentiment import POLARITY_LABELS, analyze_text_sentiment, sentiment_lexicon_info
 
 
 def evaluate_sentiment_rows(
@@ -27,6 +27,8 @@ def evaluate_sentiment_rows(
     skipped_empty_text = 0
     skipped_invalid_label = 0
     evidence_count = 0
+    lexicon_match_count = 0
+    review_required_count = 0
     for row in rows:
         text = str(row.get(text_column, "") or "").strip()
         gold = str(row.get(label_column, "") or "").strip().casefold()
@@ -39,7 +41,9 @@ def evaluate_sentiment_rows(
         result = analyze_text_sentiment(text)
         confusion[gold][result.polarity_label] += 1
         evaluated += 1
-        evidence_count += int(bool(result.evidence_terms))
+        evidence_count += int(result.evidence_status == "matched")
+        lexicon_match_count += int(bool(result.evidence_terms))
+        review_required_count += int(result.needs_review)
 
     if evaluated == 0:
         raise ValueError("유효한 텍스트와 gold label이 없습니다.")
@@ -65,7 +69,8 @@ def evaluate_sentiment_rows(
         }
 
     return {
-        "method": "rule_lexicon_fallback",
+        "method": sentiment_lexicon_info()["method"],
+        "lexicon": sentiment_lexicon_info(),
         "evaluated_count": evaluated,
         "skipped_empty_text": skipped_empty_text,
         "skipped_invalid_label": skipped_invalid_label,
@@ -73,6 +78,8 @@ def evaluate_sentiment_rows(
         "accuracy": round(correct / evaluated, 4),
         "macro_f1": round(sum(f1_values) / len(f1_values), 4),
         "evidence_coverage": round(evidence_count / evaluated, 4),
+        "lexicon_match_coverage": round(lexicon_match_count / evaluated, 4),
+        "review_required_count": review_required_count,
         "per_class": per_class,
         "confusion_matrix": confusion,
         "privacy_note": "평가 보고서에는 원문을 포함하지 않습니다.",

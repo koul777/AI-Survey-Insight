@@ -10,8 +10,13 @@ ENGINE_LABELS = {
     "kmeans": "KMeans 군집",
     "agglomerative": "계층 군집",
     "nmf": "NMF 토픽모델",
+    "nmf_minibatch": "대용량 MiniBatch NMF 토픽모델",
     "nmf_kl": "KL-NMF 토픽모델",
     "lda": "LDA 토픽모델",
+    "bertopic": "BERTopic UMAP·HDBSCAN 후보",
+    "local_embedding_kmeans": "로컬 E5 의미 임베딩 KMeans",
+    "local_embedding_agglomerative": "로컬 E5 의미 임베딩 계층 군집",
+    "local_embedding_dbscan": "로컬 E5 의미 임베딩 자연 군집",
     "openai_embedding_kmeans": "OpenAI 의미 임베딩 KMeans",
     "openai_embedding_agglomerative": "OpenAI 의미 임베딩 계층 군집",
     "openai_embedding_dbscan": "OpenAI 의미 임베딩 자연 군집",
@@ -56,26 +61,43 @@ def apply_topic_explanation(topic: Topic) -> Topic:
 
 def _recommendation_summary(recommendation: Recommendation) -> str:
     rec = recommendation.recommended
+    review_required = rec.params.get("result_quality_status") == "review_required"
     weight_acceptability = rec.metrics.get("weight_acceptability")
     sensitivity_text = (
         f" 가중치 변동 시나리오 선정률은 {weight_acceptability:.0%}였습니다."
         if weight_acceptability is not None
         else ""
     )
+    status_text = (
+        f"{rec.topic_count}개 토픽이 복합 평가에서 가장 높은 후보였지만 자동 품질 기준을 충족하지 못했습니다. "
+        if review_required
+        else f"{rec.topic_count}개 토픽이 현재 복합 평가 기준의 권장안으로 선택되었습니다. "
+    )
+    conclusion_text = (
+        "따라서 이 값을 확정 권장안으로 사용하지 말고 대표 응답과 대안 후보를 다시 검토해야 합니다."
+        if review_required
+        else "대표 응답 검토가 가능한 중간 지점을 권장값으로 잡았습니다. 이 값은 통계적으로 검증된 최적값이 아닙니다."
+    )
     return (
         f"유효 자유응답 {recommendation.valid_response_count}건을 읽기 쉬운 묶음으로 나누어 보니 "
-        f"{rec.topic_count}개 토픽이 현재 복합 평가 기준의 권장안으로 선택되었습니다. "
+        f"{status_text}"
         f"{sensitivity_text}"
         "토픽이 너무 적으면 서로 다른 의견이 섞이고, 너무 많으면 비슷한 이야기가 잘게 쪼개질 수 있어 "
-        "대표 응답 검토가 가능한 중간 지점을 권장값으로 잡았습니다. 이 값은 통계적으로 검증된 최적값이 아닙니다."
+        f"{conclusion_text}"
     )
 
 
 def _topic_count_explanation(recommendation: Recommendation) -> str:
     rec = recommendation.recommended
+    review_required = rec.params.get("result_quality_status") == "review_required"
     engines = _candidate_engine_summary(recommendation)
     wider = f"{recommendation.wider.topic_count}개" if recommendation.wider else "없음"
     detailed = f"{recommendation.detailed.topic_count}개" if recommendation.detailed else "없음"
+    result_text = (
+        f"그 결과 {rec.topic_count}개가 최고 점수 후보였지만 품질 기준 미달로 재검토가 필요합니다. "
+        if review_required
+        else f"그 결과 {rec.topic_count}개 토픽을 권장합니다. "
+    )
     return (
         f"허용 범위 {recommendation.allowed_topic_range[0]}-{recommendation.allowed_topic_range[1]}개 안에서 "
         f"{engines}을 함께 비교했습니다. 토픽 수는 두 가지 관점으로 정했습니다. "
@@ -83,7 +105,7 @@ def _topic_count_explanation(recommendation: Recommendation) -> str:
         "둘째, 문서화된 가중치를 범위 안에서 바꾼 시나리오에서도 어떤 후보가 선택되는지 확인했습니다. "
         "셋째, 담당자가 실제로 읽고 이름을 붙일 수 있을 만큼 토픽이 너무 크거나 잘게 쪼개지지 않았는지 확인했습니다. "
         f"작은 토픽이 과하게 생기지 않는지, 사람이 라벨을 붙일 수 있는지도 함께 평가했습니다. "
-        f"그 결과 {rec.topic_count}개 토픽을 권장하며, 더 넓게 보는 대안은 {wider}, 더 세분화하는 대안은 {detailed}입니다. "
+        f"{result_text}더 넓게 보는 대안은 {wider}, 더 세분화하는 대안은 {detailed}입니다. "
         "권장안과 대안의 대표 응답을 사람이 비교한 뒤 최종 토픽 수를 결정해야 합니다."
     )
 
@@ -106,7 +128,7 @@ def _quality_warnings(recommendation: Recommendation) -> list[str]:
     warnings = list(dict.fromkeys(recommendation.warnings + recommendation.recommended.warnings))
     if recommendation.valid_response_count < 30:
         warnings.append("응답 수가 적기 때문에 토픽 이름과 비율은 확정 결론보다 탐색용 단서로 읽어야 합니다.")
-    if any(topic.sentiment_method == "rule_lexicon_fallback" for topic in recommendation.recommended.topics):
+    if any("lexicon" in topic.sentiment_method for topic in recommendation.recommended.topics):
         warnings.append("감정 결과는 규칙·어휘 기반 신호입니다. 심리 진단이나 긴급성 판정이 아니므로 대표 응답과 함께 검토하세요.")
     if recommendation.recommended.params.get("tokenizer") == "regex_keyword_fallback":
         warnings.append("한국어 형태소 분석기가 설치되어 있지 않아 2글자 이상 키워드 추출 fallback을 사용했습니다.")
@@ -149,7 +171,10 @@ def _sentiment_summary(topic: Topic) -> str:
     }.get(topic.sentiment_label, "감정 방향을 단정하기 어렵습니다.")
     evidence = _join_keywords(topic.sentiment_evidence[:4])
     evidence_text = f" 근거 단어는 {evidence}입니다." if evidence else ""
-    return f"{label_text} 처리 우선도는 {topic.urgency_score:.2f}입니다.{evidence_text}"
+    distribution = topic.sentiment_distribution
+    counts_text = (f" 응답별 긍정 {distribution.get('positive', 0)}건, 부정 {distribution.get('negative', 0)}건, "
+                   f"혼합 {distribution.get('mixed', 0)}건, 중립 {distribution.get('neutral', 0)}건입니다.") if distribution else ""
+    return f"{label_text}{counts_text} 처리 우선도는 {topic.urgency_score:.2f}입니다.{evidence_text}"
 
 
 def _candidate_engine_summary(recommendation: Recommendation) -> str:

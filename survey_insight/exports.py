@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ METRIC_LABELS = {
     "coverage": "분석 포함률",
     "diversity": "토픽 키워드 다양성",
     "labelability": "라벨 해석 가능성",
+    "keyword_document_support": "상위 키워드의 소속 응답 설명률",
     "balance": "토픽 크기 균형",
     "resampling_stability": "부분표본 일치도(진단)",
     "resampling_stability_p10": "부분표본 일치도 10백분위(진단)",
@@ -59,6 +61,7 @@ def export_excel(package: AnalysisPackage, path: str | Path) -> Path:
     _write_cross_analysis(workbook.create_sheet("교차분석"), package)
     _write_model_settings(workbook.create_sheet("모델설정"), package)
     _write_user_edits(workbook.create_sheet("편집이력"), package)
+    _write_sentiment_summary(workbook.create_sheet("감정분포"), package)
     for sheet in workbook.worksheets:
         _style_sheet(sheet)
     workbook.save(target)
@@ -96,11 +99,16 @@ def export_powerpoint(package: AnalysisPackage, path: str | Path) -> Path:
 
 def _write_assigned_rows(ws: Any, package: AnalysisPackage) -> None:
     assignment_by_doc = {assignment.document_id: assignment.topic_id for assignment in package.assignments}
+    assignments = {assignment.document_id: assignment for assignment in package.assignments}
     topic_label = {topic.topic_id: topic.label for topic in package.selected_topics}
-    headers = ["row_index", "redacted_text", "privacy_review_flags", "topic_id", "topic_label"] + package.group_columns
+    headers = ["row_index", "redacted_text", "privacy_review_flags", "topic_id", "topic_label",
+               "topic_tokens", "topic_exclusion_reason", "membership_score", "score_method", "needs_review",
+               "sentiment_label", "sentiment_score", "sentiment_status", "sentiment_evidence", "sentiment_method"] + package.group_columns
     ws.append(headers)
     for doc in package.documents:
         topic_id = assignment_by_doc.get(doc.id, "")
+        assignment = assignments.get(doc.id)
+        sentiment = doc.sentiment
         ws.append(
             [
                 doc.row_index,
@@ -108,6 +116,16 @@ def _write_assigned_rows(ws: Any, package: AnalysisPackage) -> None:
                 ", ".join(doc.privacy_review_flags),
                 topic_id,
                 topic_label.get(topic_id, ""),
+                ", ".join(doc.topic_tokens),
+                doc.topic_exclusion_reason,
+                assignment.probability if assignment else None,
+                assignment.score_method if assignment else "not_assigned",
+                bool((assignment and assignment.needs_review) or sentiment.get("needs_review")),
+                sentiment.get("polarity_label", "excluded"),
+                sentiment.get("polarity_score"),
+                sentiment.get("evidence_status", "not_analyzed"),
+                json.dumps(sentiment.get("evidence_spans", []), ensure_ascii=False),
+                sentiment.get("source", ""),
                 *[doc.metadata.get(column) for column in package.group_columns],
             ]
         )
@@ -129,6 +147,7 @@ def _write_topic_summary(ws: Any, package: AnalysisPackage) -> None:
         "sentiment_evidence",
         "sentiment_method",
         "keywords",
+        "positive_count", "neutral_count", "negative_count", "mixed_count", "sentiment_evidence_coverage",
     ])
     for topic in package.selected_topics:
         ws.append([
@@ -146,7 +165,27 @@ def _write_topic_summary(ws: Any, package: AnalysisPackage) -> None:
             ", ".join(topic.sentiment_evidence),
             topic.sentiment_method,
             ", ".join(topic.keywords),
+            *[topic.sentiment_distribution.get(label, 0) for label in ("positive", "neutral", "negative", "mixed")],
+            topic.sentiment_evidence_coverage,
         ])
+
+
+def _write_sentiment_summary(ws: Any, package: AnalysisPackage) -> None:
+    ws.append(["scope", "positive", "neutral", "negative", "mixed", "evidence_coverage", "analyzed_count"])
+    summary = package.recommendation.sentiment_summary
+    counts = summary.get("label_counts", {})
+    ws.append(["전체 유효 응답", *[counts.get(label, 0) for label in ("positive", "neutral", "negative", "mixed")],
+               summary.get("evidence_coverage", 0), summary.get("analyzed_count", 0)])
+    for topic in package.selected_topics:
+        ws.append([f"{topic.topic_id} {topic.label}",
+                   *[topic.sentiment_distribution.get(label, 0) for label in ("positive", "neutral", "negative", "mixed")],
+                   topic.sentiment_evidence_coverage, topic.count])
+    ws.append([])
+    ws.append(["주의", "중립에는 사전 근거가 없는 응답이 포함됩니다. 근거 포함률을 함께 확인하세요."])
+    for key, value in summary.get("lexicon", {}).items():
+        ws.append([f"lexicon.{key}", value])
+    for key, value in package.recommendation.analysis_diagnostics.items():
+        ws.append([f"preprocessing.{key}", json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value])
 
 
 def _write_representatives(ws: Any, package: AnalysisPackage) -> None:
@@ -157,7 +196,8 @@ def _write_representatives(ws: Any, package: AnalysisPackage) -> None:
 
 
 def _write_cross_analysis(ws: Any, package: AnalysisPackage) -> None:
-    ws.append(["group_column", "group_value", "topic_id", "topic_label", "display_count", "share", "suppressed"])
+    ws.append(["group_column", "group_value", "topic_id", "topic_label", "display_count", "share", "suppressed",
+               "positive_count", "neutral_count", "negative_count", "mixed_count"])
     for row in package.cross_analysis:
         ws.append(
             [
@@ -168,6 +208,7 @@ def _write_cross_analysis(ws: Any, package: AnalysisPackage) -> None:
                 row.get("display_count"),
                 row.get("share"),
                 row.get("suppressed"),
+                *[(row.get("sentiment_counts") or {}).get(label) for label in ("positive", "neutral", "negative", "mixed")],
             ]
         )
 

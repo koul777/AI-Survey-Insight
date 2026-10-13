@@ -52,6 +52,21 @@ class StoredRun(StoredRunSummary):
 
 
 @dataclass(frozen=True)
+class StoredRunOverview:
+    run_id: str
+    dataset_id: str | None
+    project_name: str
+    mode: str
+    valid_response_count: int
+    recommended_topic_count: int
+    human_review_status: str
+    text_column: str
+    summary: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class RunDeleteResult:
     run_id: str
     deleted: bool
@@ -231,6 +246,53 @@ class StorageRepository:
             rows = conn.execute(sql, params).fetchall()
         return [_run_summary_from_row(row) for row in rows]
 
+    def list_run_overviews(self, limit: int = 10) -> list[StoredRunOverview]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    run_id,
+                    dataset_id,
+                    COALESCE(json_extract(package_json, '$.project.name'), 'Survey Insight Project')
+                        AS project_name,
+                    COALESCE(json_extract(package_json, '$.recommendation.mode'), '') AS mode,
+                    COALESCE(json_extract(package_json, '$.recommendation.valid_response_count'), 0)
+                        AS valid_response_count,
+                    COALESCE(json_array_length(package_json, '$.selected_topics'), 0)
+                        AS recommended_topic_count,
+                    COALESCE(json_extract(package_json, '$.project.human_review.status'), 'not_reviewed')
+                        AS human_review_status,
+                    COALESCE(json_extract(package_json, '$.text_column'), '') AS text_column,
+                    COALESCE(
+                        NULLIF(json_extract(package_json, '$.recommendation.plain_language_summary'), ''),
+                        json_extract(package_json, '$.methodology_note'),
+                        ''
+                    ) AS summary,
+                    created_at,
+                    updated_at
+                FROM runs
+                ORDER BY created_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [
+            StoredRunOverview(
+                run_id=str(row["run_id"]),
+                dataset_id=row["dataset_id"],
+                project_name=str(row["project_name"]),
+                mode=str(row["mode"]),
+                valid_response_count=int(row["valid_response_count"]),
+                recommended_topic_count=int(row["recommended_topic_count"]),
+                human_review_status=str(row["human_review_status"]),
+                text_column=str(row["text_column"]),
+                summary=str(row["summary"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
     def get_run(self, run_id: str) -> StoredRun | None:
         with self._connection() as conn:
             row = conn.execute(
@@ -251,6 +313,21 @@ class StorageRepository:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def get_run_recommendation_json(self, run_id: str) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT json_extract(package_json, '$.recommendation') AS recommendation_json
+                FROM runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None or row["recommendation_json"] is None:
+            return None
+        value = loads_json(row["recommendation_json"])
+        return value if isinstance(value, dict) else None
 
     def delete_run(self, run_id: str) -> RunDeleteResult:
         """Delete exactly one analysis run and report whether it existed."""

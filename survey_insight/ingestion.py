@@ -9,6 +9,8 @@ from openpyxl import load_workbook
 
 from .models import TableData
 
+KAKAO_CHAT_HEADERS = {"날짜", "시간", "작성자", "메시지", "유형"}
+
 
 def load_table(path: str | Path, sheet_name: str | None = None) -> TableData:
     source = Path(path)
@@ -22,15 +24,18 @@ def load_table_bytes(
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv":
         return _load_csv(data, filename)
+    if suffix == ".txt":
+        return _load_txt(data, filename)
     if suffix in {".xlsx", ".xlsm"}:
         return _load_xlsx(data, filename, sheet_name)
     raise ValueError(f"Unsupported file type: {suffix or filename}")
 
 
 def _load_csv(data: bytes, filename: str) -> TableData:
-    text = _decode_csv(data)
+    text = _decode_text(data)
     rows = list(csv.reader(StringIO(text)))
-    headers, records, header_idx = _rows_to_records(rows)
+    forced_header_idx = 0 if rows and KAKAO_CHAT_HEADERS.issubset(_normalized_cells(rows[0])) else None
+    headers, records, header_idx = _rows_to_records(rows, forced_header_idx=forced_header_idx)
     return TableData(
         headers=headers,
         rows=records,
@@ -38,6 +43,37 @@ def _load_csv(data: bytes, filename: str) -> TableData:
         header_row_index=header_idx,
         source_name=filename,
     )
+
+
+def _load_txt(data: bytes, filename: str) -> TableData:
+    text = _decode_text(data)
+    non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if _looks_tabular(non_empty_lines):
+        rows = list(csv.reader(StringIO(text), delimiter="\t"))
+        headers, records, header_idx = _rows_to_records(rows)
+    else:
+        headers = ["response"]
+        records = [{"response": line} for line in non_empty_lines]
+        header_idx = 0
+    return TableData(
+        headers=headers,
+        rows=records,
+        sheet_name=None,
+        header_row_index=header_idx,
+        source_name=filename,
+    )
+
+
+def _looks_tabular(lines: list[str], sample_size: int = 100) -> bool:
+    sample = lines[:sample_size]
+    if len(sample) < 2:
+        return False
+    widths = [line.count("\t") + 1 for line in sample]
+    tabular_widths = [width for width in widths if width > 1]
+    if len(tabular_widths) / len(sample) < 0.8:
+        return False
+    most_common_width = max(set(tabular_widths), key=tabular_widths.count)
+    return tabular_widths.count(most_common_width) / len(sample) >= 0.8
 
 
 def _load_xlsx(data: bytes, filename: str, sheet_name: str | None) -> TableData:
@@ -56,8 +92,11 @@ def _load_xlsx(data: bytes, filename: str, sheet_name: str | None) -> TableData:
     )
 
 
-def _decode_csv(data: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+def _decode_text(data: bytes) -> str:
+    encodings = ("utf-16", "utf-8-sig", "utf-8", "cp949", "euc-kr") if data.startswith(
+        (b"\xff\xfe", b"\xfe\xff")
+    ) else ("utf-8-sig", "utf-8", "cp949", "euc-kr")
+    for encoding in encodings:
         try:
             return data.decode(encoding)
         except UnicodeDecodeError:
@@ -65,10 +104,13 @@ def _decode_csv(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _rows_to_records(raw_rows: list[list[Any]]) -> tuple[list[str], list[dict[str, Any]], int]:
+def _rows_to_records(
+    raw_rows: list[list[Any]],
+    forced_header_idx: int | None = None,
+) -> tuple[list[str], list[dict[str, Any]], int]:
     if not raw_rows:
         return [], [], 0
-    header_idx = detect_header_row(raw_rows)
+    header_idx = forced_header_idx if forced_header_idx is not None else detect_header_row(raw_rows)
     header_cells = raw_rows[header_idx]
     width = max(len(row) for row in raw_rows)
     headers = [_normalize_header(cell, idx) for idx, cell in enumerate(_pad(header_cells, width))]
@@ -79,6 +121,10 @@ def _rows_to_records(raw_rows: list[list[Any]]) -> tuple[list[str], list[dict[st
             continue
         records.append({headers[idx]: padded[idx] for idx in range(len(headers))})
     return headers, records, header_idx
+
+
+def _normalized_cells(row: list[Any]) -> set[str]:
+    return {normalized for cell in row if (normalized := str(cell or "").strip())}
 
 
 def detect_header_row(raw_rows: list[list[Any]], max_scan_rows: int = 20) -> int:

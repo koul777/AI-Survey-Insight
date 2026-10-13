@@ -13,13 +13,14 @@ from .edits import apply_edit
 from .exports import export_excel, export_powerpoint, export_word
 from .ingestion import load_table_bytes
 from .llm_interpretation import enhance_with_user_llm
+from .local_embeddings import local_embedding_status
 from .models import AnalysisPackage, DatasetProfile, TableData, new_id, to_jsonable
 from .pipeline import analyze_table
 from .profiling import profile_table
 from .storage import StorageRepository
 from .ui import app_html
 
-app = FastAPI(title="AI Survey Insight", version="0.1.0")
+app = FastAPI(title="AI Survey Insight", version="0.2.0")
 
 _TABLES: dict[str, TableData] = {}
 _PROFILES: dict[str, DatasetProfile] = {}
@@ -40,6 +41,7 @@ class ModelRunRequest(BaseModel):
     embedding_model: str | None = None
     azure_api_version: str | None = None
     external_transfer_confirmed: bool | None = None
+    local_embeddings: bool = False
     seed: int = Field(default=42, ge=0, le=2**32 - 1)
 
 
@@ -57,6 +59,15 @@ class ExportRequest(BaseModel):
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/analysis-capabilities")
+def analysis_capabilities() -> dict[str, Any]:
+    from .sentiment import sentiment_lexicon_info
+    from .preprocessing import tokenizer_source
+
+    return {"tokenizer": tokenizer_source(), "sentiment_lexicon": sentiment_lexicon_info(),
+            "local_embeddings": local_embedding_status()}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -80,7 +91,7 @@ async def upload_dataset(
     except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail="파일을 읽지 못했습니다. CSV/XLSX 형식, 시트와 헤더를 확인해 주세요.",
+            detail="파일을 읽지 못했습니다. CSV/XLSX/TXT 형식, 시트와 헤더를 확인해 주세요.",
         ) from exc
     _TABLES[dataset_id] = table
     _PROFILES[dataset_id] = profile
@@ -103,7 +114,7 @@ def get_profile(dataset_id: str) -> dict[str, Any]:
 
 
 @app.post("/model-runs")
-def create_model_run(payload: ModelRunRequest) -> dict[str, Any]:
+def create_model_run(payload: ModelRunRequest, compact: bool = Query(False)) -> dict[str, Any]:
     table = _get_table(payload.dataset_id)
     if table is None:
         raise HTTPException(status_code=404, detail="Dataset not found.")
@@ -125,6 +136,7 @@ def create_model_run(payload: ModelRunRequest) -> dict[str, Any]:
             embedding_model=payload.embedding_model,
             azure_api_version=payload.azure_api_version,
             seed=payload.seed,
+            local_embeddings=payload.local_embeddings,
         )
     except Exception as exc:
         raise HTTPException(
@@ -167,17 +179,70 @@ def create_model_run(payload: ModelRunRequest) -> dict[str, Any]:
     )
     return {
         "run_id": run_id,
-        "recommendation": to_jsonable(package.recommendation),
+        "recommendation": _recommendation_payload(package.recommendation, compact=compact),
         "privacy_review_flag_count": package.project.get("privacy_review_flag_count", 0),
     }
 
 
 @app.get("/model-runs/{run_id}/recommendation")
-def get_recommendation(run_id: str) -> dict[str, Any]:
+def get_recommendation(run_id: str, compact: bool = Query(False)) -> dict[str, Any]:
+    if compact:
+        stored_recommendation = _STORE.get_run_recommendation_json(run_id)
+        if stored_recommendation is not None:
+            return _recommendation_payload(stored_recommendation, compact=True)
     package = _get_package(run_id)
     if package is None:
         raise HTTPException(status_code=404, detail="Model run not found.")
-    return to_jsonable(package.recommendation)
+    return _recommendation_payload(package.recommendation, compact=compact)
+
+
+def _recommendation_payload(recommendation: Any, *, compact: bool) -> dict[str, Any]:
+    payload = to_jsonable(recommendation)
+    if not compact:
+        return payload
+    for key in ("recommended", "wider", "detailed"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict):
+            candidate["assignments"] = []
+    for candidate in payload.get("candidates", []):
+        if isinstance(candidate, dict):
+            candidate["assignments"] = []
+    return payload
+
+
+@app.get("/model-runs/{run_id}/documents")
+def get_run_documents(
+    run_id: str,
+    topic_id: str | None = None,
+    sentiment_label: str | None = Query(None, pattern="^(positive|neutral|negative|mixed)$"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(25, ge=1, le=100),
+) -> dict[str, Any]:
+    package = _get_package(run_id)
+    if package is None:
+        raise HTTPException(status_code=404, detail="Model run not found.")
+    assignments = {assignment.document_id: assignment for assignment in package.assignments}
+    rows = []
+    total = 0
+    for document in package.documents:
+        assignment = assignments.get(document.id)
+        if topic_id and (assignment is None or assignment.topic_id != topic_id):
+            continue
+        if sentiment_label and document.sentiment.get("polarity_label") != sentiment_label:
+            continue
+        total += 1
+        if total <= offset or len(rows) >= limit:
+            continue
+        rows.append({
+            "document_id": document.id, "row_index": document.row_index,
+            "redacted_text": document.redacted_text,
+            "topic_tokens": document.topic_tokens,
+            "is_no_opinion": document.is_no_opinion,
+            "topic_exclusion_reason": document.topic_exclusion_reason,
+            "sentiment": document.sentiment,
+            "assignment": to_jsonable(assignment),
+        })
+    return {"total": total, "offset": offset, "limit": limit, "items": rows}
 
 
 @app.delete("/model-runs/{run_id}")
@@ -270,29 +335,7 @@ def download_export(run_id: str, export_type: str) -> FileResponse:
 
 @app.get("/projects/recent")
 def recent_projects(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
-    projects: list[dict[str, Any]] = []
-    for stored in _STORE.list_runs()[:limit]:
-        package = stored.to_analysis_package()
-        projects.append(
-            {
-                "run_id": stored.run_id,
-                "dataset_id": stored.dataset_id,
-                "project_name": package.project.get("name", "Survey Insight Project"),
-                "created_at": stored.created_at,
-                "updated_at": stored.updated_at,
-                "mode": package.recommendation.mode,
-                "valid_response_count": package.recommendation.valid_response_count,
-                "recommended_topic_count": len(package.selected_topics),
-                "human_review_status": (
-                    package.project.get("human_review", {}).get("status", "not_reviewed")
-                    if isinstance(package.project.get("human_review"), dict)
-                    else "not_reviewed"
-                ),
-                "text_column": package.text_column,
-                "summary": package.recommendation.plain_language_summary or package.methodology_note,
-            }
-        )
-    return {"projects": projects}
+    return {"projects": [to_jsonable(item) for item in _STORE.list_run_overviews(limit)]}
 
 
 def _build_export(package: AnalysisPackage, run_id: str, export_type: str) -> Path:

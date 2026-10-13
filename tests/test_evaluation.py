@@ -38,7 +38,7 @@ class SentimentEvaluationTests(unittest.TestCase):
             evaluate_sentiment_csv(source, target, text_column="response", label_column="gold")
             payload = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(payload["evaluated_count"], 2)
-        self.assertEqual(payload["method"], "rule_lexicon_fallback")
+        self.assertEqual(payload["method"], "korean_morph_lexicon_v1")
 
     def test_no_valid_gold_rows_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "gold label"):
@@ -47,6 +47,12 @@ class SentimentEvaluationTests(unittest.TestCase):
                 text_column="response",
                 label_column="gold",
             )
+
+    def test_request_match_is_not_counted_as_polarity_evidence(self) -> None:
+        report = evaluate_sentiment_rows(
+            [{"text": "개선이 필요합니다", "label": "neutral"}], text_column="text", label_column="label")
+        self.assertEqual(report["lexicon_match_coverage"], 1.0)
+        self.assertEqual(report["evidence_coverage"], 0.0)
 
 
 if __name__ == "__main__":
