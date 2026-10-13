@@ -5,9 +5,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from .chat_preprocessing import is_kakao_chat_table, prepare_kakao_chat_rows
 from .ingestion import load_table, load_table_bytes
 from .models import AnalysisPackage, TableData, to_jsonable
-from .preprocessing import preprocess_documents, valid_documents
+from .preprocessing import preprocess_documents, preprocessing_diagnostics, tokenize_keywords, valid_documents
+from .sentiment import aggregate_document_sentiment, analyze_text_sentiment, sentiment_lexicon_info, sentiment_payload
 from .profiling import profile_table
 from .topics import recommend_topics
 
@@ -24,6 +26,7 @@ def analyze_file(
     embedding_model: str | None = None,
     azure_api_version: str | None = None,
     seed: int = 42,
+    local_embeddings: bool = False,
 ) -> AnalysisPackage:
     table = load_table(path, sheet_name=sheet_name)
     return analyze_table(
@@ -37,6 +40,7 @@ def analyze_file(
         embedding_model=embedding_model,
         azure_api_version=azure_api_version,
         seed=seed,
+        local_embeddings=local_embeddings,
     )
 
 
@@ -53,6 +57,7 @@ def analyze_file_bytes(
     embedding_model: str | None = None,
     azure_api_version: str | None = None,
     seed: int = 42,
+    local_embeddings: bool = False,
 ) -> AnalysisPackage:
     table = load_table_bytes(data, filename, sheet_name=sheet_name)
     return analyze_table(
@@ -66,6 +71,7 @@ def analyze_file_bytes(
         embedding_model=embedding_model,
         azure_api_version=azure_api_version,
         seed=seed,
+        local_embeddings=local_embeddings,
     )
 
 
@@ -81,11 +87,29 @@ def analyze_table(
     embedding_model: str | None = None,
     azure_api_version: str | None = None,
     seed: int = 42,
+    local_embeddings: bool = False,
 ) -> AnalysisPackage:
     dataset_profile = profile_table(table, dataset_id=dataset_id)
     selected_text_column = text_column or _default_text_column(dataset_profile)
     selected_group_columns = group_columns if group_columns is not None else _default_group_columns(dataset_profile)
-    documents = preprocess_documents(table.rows, selected_text_column, metadata_columns=selected_group_columns)
+    if selected_text_column not in table.headers:
+        raise ValueError("선택한 자유응답 컬럼이 파일에 없습니다.")
+    if any(column not in table.headers for column in selected_group_columns):
+        raise ValueError("선택한 그룹 컬럼이 파일에 없습니다.")
+    analysis_rows = table.rows
+    chat_preprocessing: dict[str, int] | None = None
+    is_kakao_chat = is_kakao_chat_table(table) and selected_text_column == "메시지"
+    if is_kakao_chat:
+        analysis_rows, chat_preprocessing = prepare_kakao_chat_rows(table.rows)
+        dataset_profile.warnings.append(
+            "카카오톡 대화는 시스템·봇·짧은 반응을 제외하고 연속 메시지를 맥락 구간으로 묶어 분석합니다."
+        )
+    documents = preprocess_documents(analysis_rows, selected_text_column, metadata_columns=selected_group_columns)
+    for document in valid_documents(documents):
+        document.topic_tokens = tokenize_keywords(document.redacted_text)
+        document.sentiment = sentiment_payload(analyze_text_sentiment(document.redacted_text))
+        if not document.topic_tokens:
+            document.topic_exclusion_reason = "no_topic_terms"
     recommendation = recommend_topics(
         documents,
         seed=seed,
@@ -94,8 +118,30 @@ def analyze_table(
         embedding_base_url=embedding_base_url,
         embedding_model=embedding_model,
         azure_api_version=azure_api_version,
+        enable_bertopic=is_kakao_chat,
+        local_embeddings=local_embeddings,
     )
+    if chat_preprocessing is not None:
+        chat_warning = (
+            f"카카오톡 원문 {chat_preprocessing['source_rows']}행 중 잡음을 제외한 "
+            f"{chat_preprocessing['retained_messages']}개 메시지를 "
+            f"{chat_preprocessing['context_segments']}개 맥락 구간으로 묶어 분석했습니다."
+        )
+        recommendation.warnings.insert(0, chat_warning)
+        recommendation.quality_warnings = list(
+            dict.fromkeys([chat_warning, *recommendation.quality_warnings])
+        )
     selected = recommendation.recommended
+    sentiment = aggregate_document_sentiment(valid_documents(documents))
+    recommendation.sentiment_summary = {
+        "analyzed_count": sentiment.count,
+        "label_counts": sentiment.label_counts,
+        "average_score": sentiment.average_polarity_score,
+        "evidence_coverage": sentiment.evidence_coverage,
+        "no_evidence_count": sum(doc.sentiment.get("evidence_status") == "no_match" for doc in documents),
+        "lexicon": sentiment_lexicon_info(),
+    }
+    recommendation.analysis_diagnostics.update(preprocessing_diagnostics(documents))
     cross = build_cross_analysis(valid_documents(documents), selected.assignments, selected.topics, selected_group_columns)
     privacy_review_flag_count = sum(bool(document.privacy_review_flags) for document in documents)
     return AnalysisPackage(
@@ -103,6 +149,8 @@ def analyze_table(
             "name": project_name,
             "analysis_seed": seed,
             "privacy_review_flag_count": privacy_review_flag_count,
+            "chat_preprocessing": chat_preprocessing,
+            "analysis_version": "0.2.0",
         },
         dataset_profile=dataset_profile,
         text_column=selected_text_column,
@@ -128,6 +176,8 @@ def build_cross_analysis(
     assigned_topic = {assignment.document_id: assignment.topic_id for assignment in assignments}
     counts: dict[tuple[str, str, str], int] = defaultdict(int)
     totals: dict[tuple[str, str], int] = defaultdict(int)
+    sentiment_counts: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
+        lambda: {label: 0 for label in ("positive", "neutral", "negative", "mixed")})
     for doc in documents:
         topic_id = assigned_topic.get(doc.id)
         if not topic_id:
@@ -137,6 +187,9 @@ def build_cross_analysis(
             key = (column, value, topic_id)
             counts[key] += 1
             totals[(column, value)] += 1
+            label = doc.sentiment.get("polarity_label")
+            if label in sentiment_counts[key]:
+                sentiment_counts[key][label] += 1
     rows: list[dict[str, Any]] = []
     for (column, value, topic_id), count in sorted(counts.items()):
         total = totals[(column, value)]
@@ -151,6 +204,7 @@ def build_cross_analysis(
                 "share": round(count / max(1, total), 4),
                 "display_count": None if suppressed else count,
                 "suppressed": suppressed,
+                "sentiment_counts": None if suppressed else sentiment_counts[(column, value, topic_id)],
             }
         )
     return rows

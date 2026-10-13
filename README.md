@@ -10,27 +10,32 @@
 
 한국어 설문 자유응답을 로컬에서 프로파일링·마스킹·토픽 분석하고 Excel, Word, PowerPoint 검토 자료로 만드는 FastAPI 도구입니다.
 
+**[v0.2.0 다운로드](https://github.com/koul777/AI-Survey-Insight/releases/tag/v0.2.0)** · [변경 기록과 검증 범위](docs/RELEASE_0.2.0.md)
+
 ## 해결하려는 문제
 
 설문 자유응답은 양이 늘수록 사람이 일관된 기준으로 분류하고 대표 의견을 찾기 어렵습니다. AI Survey Insight는 자유응답 컬럼 탐지부터 전처리, 여러 토픽 후보 비교, 감정 신호, 그룹 비교, 보고서 생성까지 한 흐름으로 묶습니다. 결과는 자동 의사결정이 아니라 담당자가 원문과 함께 검토할 **탐색적 분석 후보**입니다.
 
 ## 핵심 특징
 
-- CSV/XLSX 업로드, 헤더 탐지, 자유응답·그룹 컬럼 추천
-- Kiwi 명사 추출과 명시적 fallback, 무응답 제외
+- CSV/XLSX/TXT 업로드, 카카오톡 대화 전처리, 헤더 탐지, 자유응답·그룹 컬럼 추천
+- Kiwi 형태소·품사 분석, Unicode 정규화, 불용어·조사 제거, 무응답 제외
 - 이메일·국내 이동전화 번호·사번/직번 패턴 마스킹
-- KMeans, 계층 군집, Frobenius NMF, KL-NMF, LDA, DBSCAN/LSA 후보 비교
+- KMeans, 계층 군집, Frobenius NMF, KL-NMF, LDA, DBSCAN/LSA와 BERTopic 후보 비교
 - NMF에는 TF-IDF, LDA에는 정수 단어 빈도를 사용하고 잠재 성분의 키워드·문서 가중치를 보존
 - 하드 군집의 class-based TF-IDF 키워드 표현과 단어·구 포함 중복 억제
 - 최소 토픽 크기와 70% 분석 포함률 구조 관문 후 휴리스틱 복합 평가
 - 같은 입력·같은 seed의 로컬 결과 재현성 검사
-- 규칙·어휘 기반 감정 신호와 검토 우선도 보조값
+- 내장 한국어 감정사전 160항목, 활용형·부정문·강조 표현 처리와 응답별 근거 구간
+- 토픽별 긍정·중립·부정·혼합 분포, 사전 근거 포함률, 응답별 조회·필터
+- 동일 문장은 한 번 적합하고 실제 응답 빈도를 복원해 반복 응답에 따른 과분할 방지
+- 설치형 Multilingual E5 의미 임베딩을 외부 전송 없이 선택적으로 사용
 - 선택적 AI provider 임베딩·근거 해석 보강 및 실패 시 로컬 fallback
 - Excel, Word, PowerPoint 보고서와 사용자 수정 이력
 
 ## 실제 사용 화면
 
-아래 이미지는 `sample_data/mock_survey_responses.csv`를 분석한 예시입니다. 화면에 표시되는 권장 토픽 수와 점수는 코드·라이브러리 버전에 따라 바뀔 수 있습니다.
+아래 이미지는 0.1.x에서 `sample_data/mock_survey_responses.csv`를 분석한 예시입니다. 0.2.0의 감정 분포와 응답별 근거 조회는 추가된 화면이므로 이 이미지에 포함되지 않습니다. 권장 토픽 수와 점수는 버전에 따라 바뀔 수 있습니다.
 
 <table>
   <tr>
@@ -47,6 +52,8 @@
 
 Python 3.11 이상이 필요합니다.
 
+릴리스의 소스 ZIP을 풀어 다음 명령을 실행합니다. 설치용 wheel을 받았다면 `python -m pip install .\ai_survey_insight-0.2.0-py3-none-any.whl`로 설치할 수도 있습니다.
+
 ```powershell
 python -m pip install -e .
 python -m uvicorn survey_insight.api:app --host 127.0.0.1 --port 8001
@@ -60,6 +67,22 @@ python -m pip install -r requirements.txt
 
 Windows에서는 `start_app.bat` 또는 `start_app.ps1`로 실행할 수 있습니다. 샘플 파일은 `sample_data/mock_survey_responses.csv`입니다.
 
+### 로컬 의미 모델 설치
+
+기본 NMF·LDA 분석과 감정사전은 API 키 없이 작동합니다. 서로 다른 표현의 의미까지 비교하려면 다음 명령으로 E5 모델을 한 번 내려받습니다.
+
+```powershell
+python -m survey_insight.cli setup-local-model
+```
+
+모델은 `out_models/multilingual-e5-small/`에 저장되며 Git이나 보고서에 포함되지 않습니다. 설치 시 모델 파일만 다운로드하고 설문 응답은 전송하지 않습니다. 설치 후 화면의 **로컬 의미 모델 함께 비교**가 활성화됩니다. 분석 시에는 `local_files_only=True`로 동작하며 자동 다운로드하지 않습니다. `SURVEY_INSIGHT_LOCAL_MODEL_PATH`로 경로를 지정할 수 있습니다.
+
+```powershell
+python -m survey_insight.cli analyze --input .\sample_data\mock_survey_responses.csv --out .\out_semantic --local-embeddings
+```
+
+한국어를 지원하는 [intfloat/multilingual-e5-small](https://huggingface.co/intfloat/multilingual-e5-small)은 MIT 모델이며, 설치한 revision을 모델 폴더의 `survey_insight_model.json`에 기록합니다. E5와 NMF·LDA를 함께 비교하므로 E5가 항상 선택되지는 않습니다. 긴 응답은 480 모델 토큰씩 모두 인코딩하고 토큰 수 가중 평균으로 결합하므로 뒤쪽 내용을 단순 절단하지 않습니다.
+
 소스 수정이나 테스트 실행이 목적이라면 FastAPI 테스트 클라이언트용 선택 의존성까지 설치합니다. 일반 실행에는 이 추가 설치가 필요하지 않습니다.
 
 ```powershell
@@ -71,9 +94,9 @@ python -m pip install -e ".[test]"
 1. CSV/XLSX를 업로드하고 추천된 자유응답 컬럼을 확인합니다.
 2. 선택한 그룹 컬럼과 원문을 로컬 SQLite에 저장합니다.
 3. 무응답을 제외하고 일부 식별정보 패턴을 마스킹합니다.
-4. 표본 크기에 맞는 토픽 수 범위에서 로컬 후보를 생성합니다.
+4. 같은 문장을 중복 제거한 뒤 1개 토픽부터 후보를 비교합니다. 카카오톡 대화에는 BERTopic 후보도 생성합니다.
 5. 구조 관문을 통과한 후보를 여섯 구성 지표와 감점으로 비교합니다.
-6. 권장안·더 넓은 대안·더 세분화한 대안의 대표 응답을 사람이 검토합니다.
+6. 원래 응답 수를 복원하고 각 응답의 감정과 토픽별 감정 분포를 함께 확인합니다.
 7. 필요할 때만 외부 AI 보강을 요청하고, 최종 라벨과 해석을 수정합니다.
 8. 보고서를 생성하고 배포 전 개인정보·소그룹·표현을 재검토합니다.
 
@@ -105,8 +128,8 @@ python -m survey_insight.cli analyze --input .\sample_data\mock_survey_responses
 
 | 구분 | 로컬 기본 분석 | 외부 AI 보강 |
 |---|---|---|
-| 토픽 후보 | TF-IDF/빈도 기반 KMeans·Frobenius NMF·KL-NMF·LDA·계층·DBSCAN | provider embedding 후보 추가 가능 |
-| 감정 | 규칙·어휘 기반 신호 | 대표 텍스트 근거 해석 보강 |
+| 토픽 후보 | TF-IDF/빈도 기반 KMeans·Frobenius NMF·KL-NMF·LDA·계층·DBSCAN, 카카오톡 대화용 BERTopic | provider embedding 후보와 카카오톡 BERTopic 입력에 선택 provider 임베딩 사용 가능 |
+| 감정 | 형태소·감정사전·부정문 규칙, 응답별 근거와 분포 | 대표 텍스트 근거 해석 보강; 응답별 사전 집계와 구분 |
 | 네트워크 | 외부 서버로 자동 전송하지 않음 | 선택한 provider로 마스킹 텍스트 또는 대표 응답이 전송될 수 있음 |
 | 실패 | 로컬 결과 제공 | 안전한 경고 후 로컬 결과 유지 |
 
@@ -133,6 +156,10 @@ API 키는 분석 요청 처리 중에만 사용하며 SQLite, 분석 package JS
 
 ## 분석 방법론과 한계
 
+0.2.0에서는 토픽과 감정을 독립적으로 분석한 후 연결합니다. `만족하지 않습니다`는 부정, `불편하지 않습니다`는 약한 긍정으로 반전하고, `개선이 필요합니다`만으로 부정 감정이라고 판단하지 않습니다. 중립에는 사전 근거가 없는 응답이 포함되므로 `evidence_status`와 근거 포함률을 함께 보세요. 사전은 [프로젝트에서 작성한 TSV](survey_insight/data/sentiment_ko.tsv)이며 KNU 사전이나 학습된 감정 분류기로 표시하지 않습니다.
+
+주제 단어가 없는 응답은 임의의 문자 조각으로 토픽을 만들지 않고 미배정으로 남기며 감정분석은 유지합니다. 토픽별 건수·감정 집계는 원래 빈도 기준이고 모델 점수·bootstrap·부분표본 진단은 중복 제거 문장 기준입니다. 선택된 임베딩이 있으면 모든 후보의 분리도를 같은 임베딩 공간에서 비교합니다. 없으면 같은 TF-IDF 공간을 사용합니다. `probability`는 하위 호환 필드명이며 `score_method`에 따라 LDA 사후 가중치, 정규화 NMF 가중치 또는 상대적 중심 유사도입니다. 분류 정확도나 보정된 신뢰확률이 아닙니다.
+
 권장 토픽 수는 “통계적 최적값”이 아닙니다. 최소 토픽 크기·분석 포함률 구조 관문을 통과한 후보에서 다음 지표를 결합한 제품용 휴리스틱입니다.
 
 - `stability` → **군집 품질 종합점수**: 하위 호환 필드이며 반복 표본의 통계적 안정성이 아님
@@ -146,7 +173,17 @@ API 키는 분석 요청 처리 중에만 사용하며 SQLite, 분석 package JS
 - `bootstrap_gate_pass_rate` → **Bootstrap 구조 관문 통과율**: 현재 배정에 조건부인 500회 복원추출 진단이며 통계적 검정력이 아님
 - `resampling_stability` → **부분표본 일치도**: 선정 후보의 5회 80% 층화 부분표본 재적합 ARI 진단이며 권장 점수에는 미포함
 
-기본 복합 가중치는 외부 정답으로 학습된 값이 아닙니다. 거의 동점인 후보에서는 제한 범위 가중치 시나리오 선정률을 먼저 보고, 같으면 더 단순한 토픽 수를 선택합니다. NMF는 Frobenius와 일반화 KL 두 목적함수를 별도 후보로 비교하고, NMF/LDA는 모델 성분에서 키워드를 뽑고 문서–토픽 가중치로 대표 응답을 정합니다. KMeans·계층·DBSCAN은 군집별 class-based TF-IDF로 키워드를 표현하고 군집 중심에 가까운 응답을 사용합니다. 이 표현은 기존 군집 배정을 바꾸지 않으며, BERTopic 전체 파이프라인을 구현했다는 뜻도 아닙니다. 점수는 같은 코퍼스의 후보를 비교하는 용도이며 서로 다른 조사 사이의 정확도 비교에 사용할 수 없습니다.
+기본 복합 가중치는 외부 정답으로 학습된 값이 아닙니다. 거의 동점인 후보에서는 제한 범위 가중치 시나리오 선정률을 먼저 보고, 같으면 더 단순한 토픽 수를 선택합니다. NMF는 Frobenius와 일반화 KL 두 목적함수를 별도 후보로 비교하고, NMF/LDA는 모델 성분에서 키워드를 뽑고 문서–토픽 가중치로 대표 응답을 정합니다. KMeans·계층·DBSCAN은 군집별 class-based TF-IDF로 키워드를 표현하고 군집 중심에 가까운 응답을 사용합니다.
+
+BERTopic `0.17.x` 후보는 공식 라이브러리의 모듈형 파이프라인을 사용합니다. 문서 임베딩을 UMAP으로 축소하고 HDBSCAN으로 자연 군집과 이상치를 찾은 뒤 class-based TF-IDF로 토픽을 표현합니다. 사용자가 OpenAI·Gemini·Azure/OpenAI-compatible 임베딩을 선택했다면 같은 임베딩을 BERTopic에도 전달합니다. 외부 임베딩이 없으면 선택한 로컬 E5를 사용하고, E5도 없으면 TF-IDF를 TruncatedSVD로 축소한 LSA 벡터를 사용하며, transformer 모델을 자동 다운로드하거나 설문 원문을 별도 서비스로 전송하지 않습니다. 따라서 이 로컬 fallback은 이름과 달리 BERT 의미 임베딩을 사용하지 않으며, BERTopic이라는 이유만으로 결과 품질이 보장되지는 않습니다. BERTopic이 만든 자연 토픽 수가 현재 표본 정책 범위를 벗어나거나 구조 관문을 통과하지 못하면 권장 후보로 채택되지 않습니다. 카카오 대화에서는 구조 관문과 70% 포함률을 통과한 BERTopic 후보의 cosine silhouette가 기존 최고 후보보다 0.05 이상 높을 때 의미 분리가 더 나은 후보로 우선합니다. 선택 후 품질 기준이 약하면 화면에 `품질 검토 필요 후보`로 표시되므로 확정 결과로 사용하면 안 됩니다. 공식 프로젝트와 설치법은 [MaartenGr/BERTopic](https://github.com/MaartenGr/BERTopic)을 참고하세요.
+
+BERTopic은 `sentence-transformers`, UMAP, HDBSCAN 등을 함께 설치하므로 최초 설치 용량과 시간이 늘어납니다.
+
+```powershell
+python -m pip install "bertopic>=0.17.4,<0.18"
+```
+
+점수는 같은 코퍼스의 후보를 비교하는 용도이며 서로 다른 조사 사이의 정확도 비교에 사용할 수 없습니다.
 
 명시적 귀무가설·효과크기·정답 토픽·사전 표본설계가 없으므로 고전적 의미의 통계적 검정력이나 p-value를 제공하지 않습니다. bootstrap과 부분표본 일치도는 표본 및 모델 선택 민감도를 드러내는 진단이며, 담당자의 토픽 라벨·대표 응답 검토를 대체하지 않습니다.
 
@@ -156,9 +193,20 @@ API 키는 분석 요청 처리 중에만 사용하며 SQLite, 분석 package JS
 
 계산식, 후보별 입력 공간, 소표본 정책과 알려진 한계는 [분석 방법론](docs/METHODOLOGY.md), 재현 가능한 점검 절차는 [기능 검증 및 결과 점검](docs/EVALUATION.md)을 확인하세요. 실제 운영 전에는 [책임 있는 AI 운영 점검표](docs/RESPONSIBLE_AI_CHECKLIST.md)를 적용하고, 판정 추적 방식은 [재현 가능한 예시](docs/TRACEABLE_EXAMPLES.md)를 참고하세요.
 
-### 재현 가능한 샘플 점검
+### 0.2.0 회귀 검증
 
-아래 값은 정확도 benchmark가 아니라 `sample_data/mock_survey_responses.csv`의 **구조적 smoke evaluation**입니다. 2026-08-09에 Python 3.12, scikit-learn 1.9, seed 42와 외부 네트워크 비활성 조건으로 다시 실행했습니다.
+```powershell
+python scripts/benchmark_analysis.py --out out_benchmark/regression.json
+python scripts/benchmark_analysis.py --stress-rows 6000 --out out_benchmark/stress.json
+```
+
+2026-10-13에 추가한 [한국어 자체 회귀 예제](tests/fixtures/korean_analysis.json)에서 감정 분류는 수정 전 12/32에서 수정 후 32/32로 개선되었습니다. 교육·급여·시설의 세 주제에 긍정과 부정 표현을 섞은 24개 응답은 ARI 1.0으로 분리되며, 같은 코퍼스를 3회 반복해도 세 주제를 유지하고 건수는 복원합니다. **개발에 사용한 자체 예제이므로 외부 정확도나 일반화 성능을 의미하지 않습니다.** 별도의 실제 설문 라벨 자료는 `evaluate-sentiment`로 검증하세요.
+
+문맥이 섞인 대화는 자동 분석이 완료되어도 품질 기준을 통과하지 못할 수 있습니다. 낮은 분리도나 재표본 안정성은 화면에서 검토 필요로 표시하며, 모델 이름만으로 분석 성공을 판정하지 않습니다. 최신 기능·검증 범위는 [0.2.0 변경 기록](docs/RELEASE_0.2.0.md)에 정리합니다.
+
+### 이전 버전의 샘플 점검 기록
+
+아래 값은 0.1.0 당시 `sample_data/mock_survey_responses.csv`의 **구조적 smoke evaluation 기록**입니다. 0.2.0의 현재 실행값이 아닙니다. 2026-08-09에 Python 3.12, scikit-learn 1.9, seed 42와 외부 네트워크 비활성 조건으로 실행한 기록을 보존합니다.
 
 ```powershell
 $env:SURVEY_INSIGHT_DISABLE_NETWORK='1'
@@ -207,7 +255,9 @@ survey_insight/
   preprocessing.py       한국어 전처리·일부 PII 패턴 마스킹
   topics.py              토픽 후보·구조 관문·휴리스틱 평가
   embeddings.py          선택 provider 임베딩
-  sentiment.py           규칙·어휘 기반 감정 신호
+  local_embeddings.py    다운로드와 분리된 오프라인 E5 추론
+  sentiment.py           형태소·사전·부정문 기반 감정과 근거
+  data/sentiment_ko.tsv  버전 관리되는 내장 한국어 감정사전
   evaluation.py          사용자 제공 감정 정답셋 집계 평가
   llm_interpretation.py  선택 provider 근거 해석
   exports.py             Excel·Word·PowerPoint 출력
@@ -219,6 +269,8 @@ out*/                    로컬 DB·생성 보고서(소스 아님)
 ```
 
 주요 API는 `POST /datasets/upload`, `GET /datasets/{dataset_id}/profile`, `DELETE /datasets/{dataset_id}?delete_runs=true`, `POST /model-runs`, `GET /model-runs/{run_id}/recommendation`, `DELETE /model-runs/{run_id}`, `POST /model-runs/{run_id}/edits`, `POST /exports`, `GET /projects/recent`입니다. 업로드 API는 파일 bytes를 요청 본문으로 받습니다. 연결 run이 있는 dataset은 기본 삭제를 거부하며, 함께 삭제하려면 `delete_runs=true`를 명시해야 합니다.
+
+`GET /analysis-capabilities`에서 형태소·감정사전 버전과 로컬 모델 준비 상태를 확인할 수 있습니다. `GET /model-runs/{run_id}/documents?topic_id=T01&sentiment_label=negative&offset=0&limit=25`는 마스킹된 응답·형태소·감정 근거·소속도만 반환합니다. `limit`은 최대 100입니다. Excel의 `감정분포`와 `원자료_토픽배정` 시트에도 같은 정보가 포함됩니다.
 
 ## 라이선스
 

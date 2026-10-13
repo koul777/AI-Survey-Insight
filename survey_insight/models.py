@@ -59,6 +59,9 @@ class TextDocument:
     is_no_opinion: bool = False
     pii_found: list[str] = field(default_factory=list)
     privacy_review_flags: list[str] = field(default_factory=list)
+    topic_tokens: list[str] = field(default_factory=list)
+    sentiment: dict[str, Any] = field(default_factory=dict)
+    topic_exclusion_reason: str | None = None
 
 
 @dataclass
@@ -80,6 +83,9 @@ class Topic:
     sentiment_plain_language: str = ""
     interpretation_source: str = "local_plain_language"
     parent_topic_id: str | None = None
+    sentiment_distribution: dict[str, int] = field(default_factory=dict)
+    sentiment_evidence_coverage: float = 0.0
+    sentiment_distribution_method: str = "document_lexicon"
 
 
 @dataclass
@@ -89,6 +95,9 @@ class TopicAssignment:
     probability: float
     is_outlier: bool
     assignment_source: str
+    membership_scores: dict[str, float] = field(default_factory=dict)
+    score_method: str = "unspecified"
+    needs_review: bool = False
 
 
 @dataclass
@@ -120,6 +129,8 @@ class Recommendation:
     topic_count_explanation: str = ""
     methodology_plain_language: str = ""
     quality_warnings: list[str] = field(default_factory=list)
+    analysis_diagnostics: dict[str, Any] = field(default_factory=dict)
+    sentiment_summary: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

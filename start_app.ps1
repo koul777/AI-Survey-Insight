@@ -14,7 +14,7 @@ try {
 }
 
 Write-Host "Checking dependencies..."
-& python -c "import fastapi, uvicorn, kiwipiepy, openpyxl, pandas, pydantic, pptx, sklearn" 2>$null
+& python -c "import bertopic, fastapi, uvicorn, kiwipiepy, openpyxl, pandas, pydantic, pptx, sklearn" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Installing required packages. The first run can take a few minutes."
     & python -m pip install -r requirements.txt

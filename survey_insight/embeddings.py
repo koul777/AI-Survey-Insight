@@ -4,7 +4,7 @@ import json
 import os
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -24,6 +24,7 @@ class EmbeddingResult:
     source: str
     model: str
     warnings: list[str]
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 def embed_texts_with_provider(

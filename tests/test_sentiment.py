@@ -12,7 +12,7 @@ class SentimentTests(unittest.TestCase):
         self.assertEqual(result.polarity_label, "positive")
         self.assertGreater(result.polarity_score, 0)
         self.assertEqual(result.urgency_score, 0.0)
-        self.assertEqual(result.source, "rule_lexicon_fallback")
+        self.assertEqual(result.source, "korean_morph_lexicon_v1")
         self.assertIn("체계적", result.evidence_terms)
         self.assertIn("도움", result.evidence_terms)
         self.assertIn("만족", result.evidence_terms)
@@ -43,14 +43,16 @@ class SentimentTests(unittest.TestCase):
         self.assertEqual(result.urgency_score, 0.0)
         self.assertEqual(result.evidence_terms, ())
 
-    def test_simple_korean_negation_suppresses_false_polarity(self) -> None:
+    def test_simple_korean_negation_reverses_polarity(self) -> None:
         positive_negated = analyze_text_sentiment("현재 교육에는 만족하지 않습니다.")
         negative_negated = analyze_text_sentiment("신청 절차가 더 이상 불편하지 않습니다.")
 
-        self.assertEqual(positive_negated.polarity_label, "neutral")
-        self.assertNotIn("만족", positive_negated.evidence_terms)
-        self.assertEqual(negative_negated.polarity_label, "neutral")
-        self.assertNotIn("불편", negative_negated.evidence_terms)
+        self.assertEqual(positive_negated.polarity_label, "negative")
+        self.assertIn("만족", positive_negated.evidence_terms)
+        self.assertTrue(positive_negated.evidence_spans[0].negated)
+        self.assertEqual(negative_negated.polarity_label, "positive")
+        self.assertIn("불편", negative_negated.evidence_terms)
+        self.assertTrue(negative_negated.evidence_spans[0].negated)
 
     def test_bulmanjok_does_not_double_count_positive_satisfaction(self) -> None:
         result = analyze_text_sentiment("평가 결과에 불만족합니다.")
@@ -85,7 +87,7 @@ class SentimentTests(unittest.TestCase):
         self.assertIn("체계적", aggregate.evidence_terms)
         self.assertIn("불만", aggregate.evidence_terms)
         self.assertIn("시급", aggregate.evidence_terms)
-        self.assertEqual(aggregate.source, "rule_lexicon_fallback")
+        self.assertEqual(aggregate.source, "korean_morph_lexicon_v1")
 
 
 if __name__ == "__main__":

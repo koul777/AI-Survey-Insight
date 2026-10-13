@@ -248,6 +248,80 @@ def app_html() -> str:
     }
     .status.error { color: var(--danger); }
     .status.ok { color: var(--green); }
+    .analysis-progress {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 11px 12px;
+      background: var(--surface-soft);
+      box-shadow: var(--shadow-soft);
+    }
+    .analysis-progress[hidden] { display: none; }
+    .analysis-progress-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .analysis-progress-value {
+      color: var(--accent-dark);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .analysis-progress-track {
+      height: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #dfe6eb;
+    }
+    .analysis-progress-fill {
+      position: relative;
+      width: 0;
+      height: 100%;
+      overflow: hidden;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--accent-dark), var(--accent));
+      transition: width 0.7s ease;
+    }
+    .analysis-progress-fill::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      width: 45%;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+      animation: progress-shimmer 1.4s linear infinite;
+    }
+    .analysis-progress-hint {
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .analysis-progress.complete .analysis-progress-fill {
+      background: var(--green);
+    }
+    .analysis-progress.complete .analysis-progress-fill::after,
+    .analysis-progress.error .analysis-progress-fill::after {
+      display: none;
+    }
+    .analysis-progress.error {
+      border-color: rgba(180, 35, 24, 0.35);
+      background: #fff7f6;
+    }
+    .analysis-progress.error .analysis-progress-fill {
+      background: var(--danger);
+    }
+    @keyframes progress-shimmer {
+      from { transform: translateX(-120%); }
+      to { transform: translateX(260%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .analysis-progress-fill { transition: none; }
+      .analysis-progress-fill::after { animation: none; }
+    }
     .metrics {
       display: grid;
       grid-template-columns: repeat(4, minmax(120px, 1fr));
@@ -775,7 +849,7 @@ def app_html() -> str:
           </div>
           <div>
             <label for="fileInput">설문 파일</label>
-            <input id="fileInput" type="file" accept=".xlsx,.xlsm,.csv" />
+            <input id="fileInput" type="file" accept=".xlsx,.xlsm,.csv,.txt" />
           </div>
           <button id="uploadBtn" class="primary">업로드</button>
           <div id="uploadStatus" class="status"></div>
@@ -797,6 +871,10 @@ def app_html() -> str:
               <option value="azure_openai">Azure OpenAI</option>
               <option value="custom">OpenAI 호환 서버</option>
             </select>
+          </div>
+          <div class="trust-note">
+            <label><input id="localEmbeddings" type="checkbox" style="width:auto" disabled /> 로컬 의미 모델 함께 비교</label>
+            <p id="localModelStatus">설치된 한국어 지원 의미 모델을 확인 중입니다.</p>
           </div>
           <div id="providerSettings" class="stack">
             <div class="trust-note"><strong>외부 전송 안내</strong><br />아래 preset은 예시이며 현재 제공을 보장하지 않습니다. 직접 모델명을 입력할 수 있습니다. API 키는 요청 중에만 사용하고 저장하지 않으며, 호출 실패 시 로컬 분석으로 돌아갑니다.</div>
@@ -830,6 +908,24 @@ def app_html() -> str:
           </div>
           <button id="runBtn" class="primary" disabled>분석 실행</button>
           <div id="runStatus" class="status"></div>
+          <div id="analysisProgress" class="analysis-progress" hidden>
+            <div class="analysis-progress-meta">
+              <span id="analysisProgressLabel">분석 준비 중</span>
+              <span id="analysisProgressValue" class="analysis-progress-value">예상 0%</span>
+            </div>
+            <div
+              id="analysisProgressBar"
+              class="analysis-progress-track"
+              role="progressbar"
+              aria-labelledby="analysisProgressLabel"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <div id="analysisProgressFill" class="analysis-progress-fill"></div>
+            </div>
+            <div id="analysisProgressHint" class="analysis-progress-hint">진행률은 경과 시간에 따른 예상치이며, 실제 완료 여부는 서버 응답으로 확인합니다.</div>
+          </div>
           <div class="row">
             <button id="excelBtn" class="secondary" disabled>Excel 생성</button>
             <button id="wordBtn" class="secondary" disabled>Word 생성</button>
@@ -858,6 +954,19 @@ def app_html() -> str:
         </div>
         <div id="topics" class="tab-panel">
           <div id="topicList" class="empty">토픽 결과가 없습니다.</div>
+          <section class="dashboard-section" style="margin-top:24px">
+            <h3>응답별 토픽·감정 근거</h3>
+            <p>마스킹한 응답과 형태소, 부정 표현이 반영된 감정 근거를 확인합니다.</p>
+            <div class="row">
+              <label for="documentTopic">토픽</label>
+              <select id="documentTopic"><option value="">전체</option></select>
+              <label for="documentSentiment">감정</label>
+              <select id="documentSentiment"><option value="">전체</option><option value="positive">긍정</option><option value="neutral">중립·근거 없음</option><option value="negative">부정</option><option value="mixed">혼합</option></select>
+              <button id="documentLoadBtn" class="secondary" type="button">응답 확인</button>
+            </div>
+            <div id="documentRows" role="region" aria-label="응답별 분석 결과" aria-live="polite" class="empty">분석 후 응답을 확인할 수 있습니다.</div>
+            <div class="row"><button id="documentPrev" class="secondary" type="button" disabled>이전</button><span id="documentPage"></span><button id="documentNext" class="secondary" type="button" disabled>다음</button></div>
+          </section>
         </div>
         <div id="history" class="tab-panel">
           <div class="row tab-toolbar">
@@ -875,6 +984,10 @@ def app_html() -> str:
   </main>
   <script>
     const state = { datasetId: null, profile: null, runId: null, recommendation: null, historyLoaded: false };
+    let analysisProgressTimer = null;
+    let analysisProgressStartedAt = 0;
+    let documentOffset = 0;
+    let documentRequestVersion = 0;
     const $ = (id) => document.getElementById(id);
     const fmt = (value) => value === null || value === undefined || value === "" ? "-" : String(value);
     const pct = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
@@ -893,10 +1006,16 @@ def app_html() -> str:
     $("powerpointBtn").addEventListener("click", () => createExport("powerpoint"));
     $("reviewBtn").addEventListener("click", recordHumanReview);
     $("historyRefreshBtn").addEventListener("click", () => loadRecentProjects(true));
+    $("documentLoadBtn").addEventListener("click", () => loadDocuments(0));
+    $("documentTopic").addEventListener("change", () => loadDocuments(0));
+    $("documentSentiment").addEventListener("change", () => loadDocuments(0));
+    $("documentPrev").addEventListener("click", () => loadDocuments(Math.max(0, documentOffset - 25)));
+    $("documentNext").addEventListener("click", () => loadDocuments(documentOffset + 25));
     $("llmProvider").addEventListener("change", updateProviderSettings);
     $("llmModelSelect").addEventListener("change", syncModelSelection);
 
     checkHealth();
+    checkAnalysisCapabilities();
     loadRecentProjects();
     updateProviderSettings();
 
@@ -909,6 +1028,20 @@ def app_html() -> str:
       } catch (err) {
         $("apiState").textContent = "API 오류";
         $("apiState").className = "pill warn";
+      }
+    }
+
+    async function checkAnalysisCapabilities() {
+      try {
+        const capabilities = await readJson(await fetch("/analysis-capabilities"));
+        const ready = !!(capabilities.local_embeddings || {}).available;
+        $("localEmbeddings").disabled = !ready;
+        $("localEmbeddings").checked = ready;
+        $("localModelStatus").textContent = ready
+          ? "Multilingual E5 준비 완료. 문장의 의미를 이 PC에서 분석하며 응답을 외부에 전송하지 않습니다."
+          : "기본 형태소 토픽모델을 사용할 수 있습니다. 의미 모델은 README의 1회 설치 후 활성화됩니다.";
+      } catch (error) {
+        $("localModelStatus").textContent = "형태소 기반 토픽모델을 사용합니다.";
       }
     }
 
@@ -954,6 +1087,7 @@ def app_html() -> str:
         state.profile = payload.profile;
         state.runId = null;
         state.recommendation = null;
+        resetAnalysisProgress();
         renderProfile(payload.profile);
         setStatus("uploadStatus", `업로드 완료: ${payload.profile.row_count}행, ${payload.profile.column_count}컬럼`, "ok");
         $("runBtn").disabled = false;
@@ -977,13 +1111,17 @@ def app_html() -> str:
         return setStatus("runStatus", "외부 AI로 전송될 수 있는 데이터와 조직 정책을 확인한 뒤 체크해 주세요.", "error");
       }
       setBusy("runBtn", true);
-      setStatus("runStatus", "분석 중", "");
+      $("runBtn").textContent = "분석 중…";
+      $("runBtn").setAttribute("aria-busy", "true");
+      setStatus("runStatus", "분석 중입니다. 잠시만 기다려 주세요.", "");
+      startAnalysisProgress();
       try {
         const body = {
           dataset_id: state.datasetId,
           project_name: $("projectName").value || "Survey Insight Project",
           text_column: $("textColumn").value || null,
           group_columns: Array.from($("groupColumns").selectedOptions).map((option) => option.value),
+          local_embeddings: $("localEmbeddings").checked,
           llm_provider: selectedProvider || null,
           llm_api_key: $("llmApiKey").value || null,
           llm_base_url: $("llmBaseUrl").value || null,
@@ -993,7 +1131,7 @@ def app_html() -> str:
           external_transfer_confirmed: selectedProvider ? $("externalTransferConfirmed").checked : null,
         };
         $("llmApiKey").value = "";
-        const res = await fetch("/model-runs", {
+        const res = await fetch("/model-runs?compact=true", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body)
@@ -1012,10 +1150,14 @@ def app_html() -> str:
         $("powerpointBtn").disabled = false;
         $("reviewBtn").disabled = false;
         setStatus("reviewStatus", "아직 담당자 검토가 기록되지 않았습니다.", "");
+        completeAnalysisProgress();
       } catch (err) {
+        failAnalysisProgress();
         setStatus("runStatus", err.message, "error");
       } finally {
         setBusy("runBtn", false);
+        $("runBtn").textContent = "분석 실행";
+        $("runBtn").removeAttribute("aria-busy");
       }
     }
 
@@ -1197,7 +1339,7 @@ def app_html() -> str:
           <td>${candidate.metrics.weight_acceptability ?? "-"}</td>
         </tr>
       `).join("");
-      const warnings = [...(rec.warnings || []), ...(rec.quality_warnings || [])]
+      const warnings = [...new Set([...(rec.warnings || []), ...(rec.quality_warnings || [])])]
         .map((warning) => `<span class="pill warn">${escapeHtml(warning)}</span>`)
         .join(" ");
       $("candidateTable").className = "stack";
@@ -1220,10 +1362,12 @@ def app_html() -> str:
       const topicCount = recommended.topic_count || 0;
       const summary = firstValue(rec, ["plain_language_summary", "summary_plain_language"], firstValue(recommended, ["plain_language_summary", "summary_plain_language"], ""));
       const reason = firstValue(rec, ["topic_count_explanation", "recommendation_reason", "topic_count_reason", "why_recommended"], firstValue(recommended, ["recommendation_reason", "topic_count_reason", "why_recommended"], ""));
-      const warnings = [...(rec.warnings || []), ...(rec.quality_warnings || [])].filter(Boolean);
+      const warnings = [...new Set([...(rec.warnings || []), ...(rec.quality_warnings || [])])].filter(Boolean);
       const topics = recommended.topics || [];
       const metrics = recommended.metrics || {};
       const engine = engineLabel((recommended.params || {}).engine || "unknown");
+      const reviewRequired = (recommended.params || {}).result_quality_status === "review_required";
+      const recommendationLabel = reviewRequired ? "품질 검토 필요 후보" : "권장안";
       const priorityTopics = [...topics]
         .sort((a, b) => priorityScore(b) - priorityScore(a));
       $("recommendationExplanation").innerHTML = `
@@ -1236,6 +1380,7 @@ def app_html() -> str:
                 <span class="pill">유효 응답 ${escapeHtml(rec.valid_response_count)}건</span>
                 <span class="pill">${escapeHtml(engine)}</span>
                 <span class="pill">권장 범위 ${escapeHtml((rec.allowed_topic_range || []).join("-"))}개</span>
+                ${reviewRequired ? `<span class="pill warn">확정 사용 금지 · 재검토 필요</span>` : ""}
               </div>
             </div>
             <div>
@@ -1246,9 +1391,11 @@ def app_html() -> str:
 
           <section class="decision-grid">
             ${decisionCard("wide", "더 적게 묶으면", rec.wider ? `${rec.wider.topic_count}개 대안` : "대안 없음", "서로 다른 의견이 한 바구니에 섞일 수 있어 담당 부서와 조치 방향을 나누기 어렵습니다.")}
-            ${decisionCard("recommended", "권장안", `${topicCount}개`, "응답끼리는 비슷하게 묶이고 토픽끼리는 비교적 구분되어 담당자가 이름을 붙이고 읽기 쉬운 균형점입니다.")}
+            ${decisionCard("recommended", recommendationLabel, `${topicCount}개`, reviewRequired ? "자동 품질 기준을 충족하지 못했습니다. 대표 응답과 다른 후보를 비교하기 전에는 확정값으로 사용하지 마세요." : "응답끼리는 비슷하게 묶이고 토픽끼리는 비교적 구분되어 담당자가 이름을 붙이고 읽기 쉬운 균형점입니다.")}
             ${decisionCard("detailed", "더 잘게 나누면", rec.detailed ? `${rec.detailed.topic_count}개 대안` : "대안 없음", "세부 차이는 더 보이지만 비슷한 이야기가 쪼개져 전체 흐름을 파악하기 어려울 수 있습니다.")}
           </section>
+
+          ${sentimentOverview(rec)}
 
           <section class="dashboard-section">
             <p class="eyebrow">토픽 수를 정한 이유</p>
@@ -1260,7 +1407,8 @@ def app_html() -> str:
               ${scoreCard("군집 분리도", metrics.semantic_quality, "노이즈 응답을 제외한 cosine silhouette의 음수를 0으로 제한한 값")}
               ${scoreCard("분석 포함률", metrics.coverage, "노이즈로 제외되지 않고 토픽에 배정된 유효 응답 비율")}
               ${scoreCard("토픽 키워드 다양성", metrics.diversity, "단어·구 포함 중복을 줄인 뒤 토픽별 상위 키워드가 서로 겹치지 않는 정도")}
-              ${scoreCard("라벨 해석 가능성", metrics.labelability, "키워드와 대표 응답이 라벨 검토에 충분한지 보는 휴리스틱")}
+              ${scoreCard("라벨 해석 가능성", metrics.labelability, "대표 응답의 충실도와 소속 문서가 상위 키워드로 설명되는 비율을 결합한 값")}
+              ${metrics.keyword_document_support !== undefined ? scoreCard("키워드 응답 설명률", metrics.keyword_document_support, "각 토픽의 상위 키워드가 2개 이상 나타나는 소속 응답 비율의 평균") : ""}
               ${scoreCard("토픽 크기 균형", metrics.balance, "한 토픽의 과도한 지배 여부를 엔트로피 기반으로 점검한 값")}
               ${metrics.weight_acceptability !== undefined ? scoreCard("가중치 시나리오 선정률", metrics.weight_acceptability, "기본 가중치를 각각 50~150% 범위에서 바꾸고 재정규화한 512개 시나리오 중 같은 후보가 선택된 비율입니다. 정확도 확률이 아닙니다") : ""}
               ${metrics.bootstrap_gate_pass_rate !== undefined ? scoreCard("Bootstrap 구조 관문 통과율", metrics.bootstrap_gate_pass_rate, "현재 토픽 배정에 조건부로 응답을 500회 복원추출했을 때 최소 크기와 포함률 관문을 유지한 비율입니다. 통계적 검정력이 아닙니다") : ""}
@@ -1278,7 +1426,7 @@ def app_html() -> str:
 
           <section class="dashboard-section">
             <p class="eyebrow">전체 토픽 표</p>
-            <h3>권장안의 모든 토픽</h3>
+            <h3>${reviewRequired ? "검토 필요 후보의 모든 토픽" : "권장안의 모든 토픽"}</h3>
             <p>위 카드와 같은 토픽을 표 형태로 다시 정리했습니다. 빠르게 비교할 때 사용하세요.</p>
             ${topicTable(topics)}
           </section>
@@ -1301,6 +1449,56 @@ def app_html() -> str:
           <p>${escapeHtml(text)}</p>
         </article>
       `;
+    }
+
+    function sentimentOverview(rec) {
+      const summary = rec.sentiment_summary || {};
+      const count = Number(summary.analyzed_count || 0);
+      if (!count) return "";
+      const diagnostics = rec.analysis_diagnostics || {};
+      const lexicon = summary.lexicon || {};
+      return `<section class="dashboard-section"><p class="eyebrow">전체 응답의 감정 분포</p>
+        <h3>토픽 분석과 함께 ${count}건의 감정을 분석했습니다</h3>
+        ${sentimentCounts(summary.label_counts || {}, count)}
+        <p>감정 근거 포함률 ${pct(summary.evidence_coverage)} · 사전 근거 없음 ${Number(summary.no_evidence_count || 0)}건. 중립에는 감정을 판단할 근거가 없는 응답도 포함됩니다.</p>
+        <details><summary>전처리·감정사전 확인</summary><p>${escapeHtml(diagnostics.tokenizer || "")} · 내장 감정사전 ${Number(lexicon.entry_count || 0)}항목 · v${escapeHtml(lexicon.version || "")}</p>
+        <p>무응답 ${Number(diagnostics.no_opinion_count || 0)}건 · 주제 단어 없음 ${Number(diagnostics.empty_topic_vocabulary_count || 0)}건 · 동일 문장 반복 ${Number(diagnostics.duplicate_response_count || 0)}건</p></details></section>`;
+    }
+
+    function sentimentCounts(counts, total) {
+      return `<div class="sentiment-bars" aria-label="감정별 응답 수">${["positive", "neutral", "negative", "mixed"].map(label => {
+        const count = Math.max(0, Number(counts[label] || 0));
+        const width = Math.max(0, Math.min(100, count / Math.max(1, total) * 100));
+        return `<div class="sentiment-meter"><span>${escapeHtml(sentimentLabel(label))}</span><div class="sentiment-meter-track" aria-hidden="true"><div class="sentiment-meter-fill ${label}" style="width:${width}%"></div></div><span>${count}건 · ${Math.round(width)}%</span></div>`;
+      }).join("")}</div>`;
+    }
+
+    async function loadDocuments(offset = 0) {
+      if (!state.runId) return;
+      const version = ++documentRequestVersion;
+      const runId = state.runId;
+      const params = new URLSearchParams({offset: String(offset), limit: "25"});
+      if ($("documentTopic").value) params.set("topic_id", $("documentTopic").value);
+      if ($("documentSentiment").value) params.set("sentiment_label", $("documentSentiment").value);
+      $("documentRows").textContent = "응답을 불러오는 중입니다.";
+      try {
+        const payload = await readJson(await fetch(`/model-runs/${encodeURIComponent(runId)}/documents?${params}`));
+        if (version !== documentRequestVersion || runId !== state.runId) return;
+        documentOffset = offset;
+        $("documentRows").className = "table-wrap";
+        $("documentRows").innerHTML = payload.items.length ? `<table><thead><tr><th>행·토픽</th><th>응답·형태소</th><th>감정과 근거</th><th>모델 소속도</th></tr></thead><tbody>${payload.items.map(item => {
+          const sentiment = item.sentiment || {};
+          const assignment = item.assignment || {};
+          const evidence = (sentiment.evidence_spans || []).map(e => `${e.text}${e.negated ? " (부정 표현 반영)" : ""}`).join(" · ");
+          const sentimentName = item.is_no_opinion ? "무응답 제외" : sentiment.polarity_label ? sentimentLabel(sentiment.polarity_label) : "미분석";
+          return `<tr><td>${Number(item.row_index)}<br>${escapeHtml(assignment.topic_id || "제외")}</td><td>${escapeHtml(item.redacted_text)}<br><small>${escapeHtml((item.topic_tokens || []).join(" · "))}</small></td><td>${escapeHtml(sentimentName)}${sentiment.needs_review ? " · 감정 검토 필요" : ""}<br>${escapeHtml(evidence || "사전 근거 없음")}</td><td>${assignment.probability !== undefined ? Number(assignment.probability).toFixed(2) : "—"}${assignment.needs_review ? " · 토픽 검토 필요" : ""}</td></tr>`;
+        }).join("")}</tbody></table>` : `<p class="empty">선택한 조건에 해당하는 응답이 없습니다.</p>`;
+        $("documentPage").textContent = `${payload.total ? offset + 1 : 0}–${Math.min(payload.total, offset + 25)} / ${payload.total}건 · 소속도는 정확도 확률이 아닙니다.`;
+        $("documentPrev").disabled = offset === 0;
+        $("documentNext").disabled = offset + 25 >= payload.total;
+      } catch (error) {
+        if (version === documentRequestVersion) $("documentRows").textContent = "응답을 불러오지 못했습니다. 다시 시도해 주세요.";
+      }
     }
 
     function scoreCard(label, value, description) {
@@ -1352,6 +1550,7 @@ def app_html() -> str:
             <span class="pill">${escapeHtml(sentimentMethodLabel(topic.sentiment_method))}</span>
           </div>
           <p>${escapeHtml(plain)}</p>
+          ${topic.sentiment_distribution && Object.keys(topic.sentiment_distribution).length ? `<p>응답별 사전 분석 분포</p>${sentimentCounts(topic.sentiment_distribution, topic.count)}` : ""}
           <div class="sentiment-bars">
             <div class="sentiment-meter">
               <span>어휘 극성 신호</span>
@@ -1430,6 +1629,8 @@ def app_html() -> str:
       if (value.includes("openai")) return "OpenAI 근거 보강";
       if (value.includes("gemini")) return "Gemini 근거 보강";
       if (value.includes("claude")) return "Claude 근거 보강";
+      if (value.includes("morph_lexicon")) return "형태소·감정사전·부정문 규칙";
+      if (value.includes("surface_lexicon")) return "대체 어휘 분석 · 검토 필요";
       if (value.includes("rule")) return "규칙·어휘 기반 신호";
       return value || "분석 방식 미상";
     }
@@ -1442,7 +1643,7 @@ def app_html() -> str:
     function sentimentLabel(label) {
       return {
         positive: "긍정",
-        negative: "개선 필요",
+        negative: "부정",
         mixed: "긍정/부정 혼재",
         neutral: "중립",
       }[String(label || "neutral").toLowerCase()] || "중립";
@@ -1454,8 +1655,13 @@ def app_html() -> str:
         kmeans: "KMeans 군집",
         agglomerative: "계층 군집",
         nmf: "NMF 토픽모델",
+        nmf_minibatch: "대용량 MiniBatch NMF 토픽모델",
         nmf_kl: "KL-NMF 토픽모델",
         lda: "LDA 토픽모델",
+        bertopic: "BERTopic UMAP·HDBSCAN",
+        local_embedding_kmeans: "로컬 E5 의미 임베딩",
+        local_embedding_agglomerative: "로컬 E5 의미 임베딩",
+        local_embedding_dbscan: "로컬 E5 의미 임베딩",
         openai_embedding_kmeans: "OpenAI 의미 임베딩",
         openai_embedding_agglomerative: "OpenAI 의미 임베딩",
         openai_embedding_dbscan: "OpenAI 의미 임베딩",
@@ -1469,6 +1675,14 @@ def app_html() -> str:
     }
 
     function renderTopics(topics) {
+      documentRequestVersion++;
+      documentOffset = 0;
+      $("documentRows").className = "empty";
+      $("documentRows").textContent = "응답 확인을 눌러 세부 근거를 확인하세요.";
+      $("documentPage").textContent = "";
+      $("documentPrev").disabled = true;
+      $("documentNext").disabled = true;
+      $("documentTopic").innerHTML = `<option value="">전체</option>${topics.map(topic => `<option value="${escapeAttr(topic.topic_id)}">${escapeHtml(topic.label)}</option>`).join("")}<option value="OUTLIER">미배정</option>`;
       if (!topics.length) {
         $("topicList").className = "empty";
         $("topicList").textContent = "토픽 결과가 없습니다.";
@@ -1533,18 +1747,44 @@ def app_html() -> str:
             <div class="history-meta">${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
             ${summary ? `<p class="history-summary">${escapeHtml(summary)}</p>` : ""}
             <div class="history-actions">
+              ${runId ? `<button class="primary" type="button" data-open-run="${escapeAttr(runId)}">결과 보기</button>` : ""}
               ${runId ? `<button class="secondary" type="button" data-delete-run="${escapeAttr(runId)}" data-delete-title="${escapeAttr(title)}">분석 결과 삭제</button>` : ""}
               ${record.dataset_id ? `<button class="danger" type="button" data-delete-dataset="${escapeAttr(record.dataset_id)}" data-delete-title="${escapeAttr(title)}">원본·연결 분석 삭제</button>` : ""}
             </div>
           </article>
         `;
       }).join("");
+      document.querySelectorAll("[data-open-run]").forEach((button) => {
+        button.addEventListener("click", () => openHistoricalRun(button.dataset.openRun));
+      });
       document.querySelectorAll("[data-delete-run]").forEach((button) => {
         button.addEventListener("click", () => deleteRun(button.dataset.deleteRun, button.dataset.deleteTitle));
       });
       document.querySelectorAll("[data-delete-dataset]").forEach((button) => {
         button.addEventListener("click", () => deleteDatasetWithRuns(button.dataset.deleteDataset, button.dataset.deleteTitle));
       });
+    }
+
+    async function openHistoricalRun(runId) {
+      if (!runId) return;
+      setStatus("historyStatus", "결과를 불러오는 중", "");
+      try {
+        const recommendation = await readJson(
+          await fetch(`/model-runs/${encodeURIComponent(runId)}/recommendation?compact=true`)
+        );
+        state.runId = runId;
+        state.recommendation = recommendation;
+        renderRecommendation(recommendation);
+        renderTopics(recommendation.recommended?.topics || []);
+        $("excelBtn").disabled = false;
+        $("wordBtn").disabled = false;
+        $("powerpointBtn").disabled = false;
+        $("reviewBtn").disabled = false;
+        setStatus("historyStatus", "분석 결과를 불러왔습니다.", "ok");
+        activateTab("recommendation");
+      } catch (err) {
+        setStatus("historyStatus", `결과를 불러오지 못했습니다. ${err.message}`, "error");
+      }
     }
 
     async function deleteRun(runId, title) {
@@ -1634,6 +1874,70 @@ def app_html() -> str:
       const el = $(id);
       el.textContent = message;
       el.className = `status ${kind || ""}`;
+    }
+
+    function startAnalysisProgress() {
+      resetAnalysisProgress();
+      const panel = $("analysisProgress");
+      panel.hidden = false;
+      analysisProgressStartedAt = Date.now();
+      updateAnalysisProgress(5, "분석 중 · 경과 0초", "예상 5%");
+      analysisProgressTimer = window.setInterval(() => {
+        const elapsedSeconds = Math.max(1, Math.floor((Date.now() - analysisProgressStartedAt) / 1000));
+        const estimated = Math.min(92, Math.round(8 + 84 * (1 - Math.exp(-elapsedSeconds / 24))));
+        updateAnalysisProgress(
+          estimated,
+          `분석 중 · 경과 ${formatElapsed(elapsedSeconds)}`,
+          `예상 ${estimated}%`
+        );
+      }, 800);
+    }
+
+    function completeAnalysisProgress() {
+      clearAnalysisProgressTimer();
+      $("analysisProgress").className = "analysis-progress complete";
+      updateAnalysisProgress(100, "분석 완료", "100%");
+      $("analysisProgressHint").textContent = "서버에서 분석 완료 응답을 받았습니다.";
+    }
+
+    function failAnalysisProgress() {
+      clearAnalysisProgressTimer();
+      const panel = $("analysisProgress");
+      panel.className = "analysis-progress error";
+      const current = Number($("analysisProgressBar").getAttribute("aria-valuenow") || 0);
+      updateAnalysisProgress(current, "분석 중 오류가 발생했습니다", `${current}%에서 중단`);
+      $("analysisProgressHint").textContent = "아래 오류 내용을 확인한 뒤 다시 실행해 주세요.";
+    }
+
+    function resetAnalysisProgress() {
+      clearAnalysisProgressTimer();
+      const panel = $("analysisProgress");
+      panel.hidden = true;
+      panel.className = "analysis-progress";
+      $("analysisProgressHint").textContent = "진행률은 경과 시간에 따른 예상치이며, 실제 완료 여부는 서버 응답으로 확인합니다.";
+      updateAnalysisProgress(0, "분석 준비 중", "예상 0%");
+    }
+
+    function clearAnalysisProgressTimer() {
+      if (analysisProgressTimer !== null) {
+        window.clearInterval(analysisProgressTimer);
+        analysisProgressTimer = null;
+      }
+    }
+
+    function updateAnalysisProgress(value, label, valueLabel) {
+      const boundedValue = Math.max(0, Math.min(100, Number(value) || 0));
+      $("analysisProgressLabel").textContent = label;
+      $("analysisProgressValue").textContent = valueLabel;
+      $("analysisProgressFill").style.width = `${boundedValue}%`;
+      $("analysisProgressBar").setAttribute("aria-valuenow", String(boundedValue));
+      $("analysisProgressBar").setAttribute("aria-valuetext", `${valueLabel}, ${label}`);
+    }
+
+    function formatElapsed(totalSeconds) {
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return minutes ? `${minutes}분 ${seconds}초` : `${seconds}초`;
     }
 
     async function readJson(res) {

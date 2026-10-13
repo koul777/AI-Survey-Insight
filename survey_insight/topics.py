@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import math
+import os
 import warnings
 from collections import Counter, defaultdict
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
-from sklearn.cluster import AgglomerativeClustering, DBSCAN, KMeans
-from sklearn.decomposition import LatentDirichletAllocation, NMF
+
+# Restricted Windows sessions may block joblib's legacy WMIC probe and print a
+# misleading traceback even though analysis continues normally.
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(max(1, min(os.cpu_count() or 1, 61))))
+
+from sklearn.cluster import AgglomerativeClustering, DBSCAN, KMeans, MiniBatchKMeans
+from sklearn.decomposition import LatentDirichletAllocation, MiniBatchNMF, NMF
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.metrics import adjusted_rand_score, silhouette_score
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import Normalizer
 from sklearn.decomposition import TruncatedSVD
 
 from .embeddings import embed_texts_with_provider
+from .local_embeddings import embed_texts_locally
 from .explanations import apply_plain_language_explanations
 from .labeling import label_topic
 from .models import (
@@ -26,7 +35,7 @@ from .models import (
     new_id,
 )
 from .preprocessing import tokenize_keywords, tokenizer_source, valid_documents
-from .sentiment import aggregate_topic_sentiment
+from .sentiment import aggregate_document_sentiment
 
 
 SCORE_WEIGHTS = {
@@ -40,6 +49,9 @@ SCORE_WEIGHTS = {
 WEIGHT_SENSITIVITY_SCENARIOS = 512
 WEIGHT_MULTIPLIER_RANGE = (0.50, 1.50)
 ASSIGNMENT_BOOTSTRAP_REPEATS = 500
+LARGE_DATASET_THRESHOLD = 5000
+LARGE_DATASET_CANDIDATE_COUNT = 8
+SILHOUETTE_SAMPLE_SIZE = 2000
 
 
 def recommend_topics(
@@ -50,13 +62,44 @@ def recommend_topics(
     embedding_base_url: str | None = None,
     embedding_model: str | None = None,
     azure_api_version: str | None = None,
+    enable_bertopic: bool = False,
+    local_embeddings: bool = False,
 ) -> Recommendation:
-    valid = valid_documents(documents)
+    all_valid = valid_documents(documents)
+    valid = []
+    excluded = []
+    for document in all_valid:
+        if not document.topic_tokens and document.topic_exclusion_reason != "no_topic_terms":
+            document.topic_tokens = tokenize_keywords(document.redacted_text)
+        if document.topic_tokens:
+            valid.append(document)
+        else:
+            document.topic_exclusion_reason = "no_topic_terms"
+            excluded.append(document)
+    topic_documents = valid
+    unique_documents: dict[str, TextDocument] = {}
+    for document in topic_documents:
+        unique_documents.setdefault(document.redacted_text, document)
+    valid = list(unique_documents.values())
     n = len(valid)
     mode, topic_range, min_topic_size, warnings = topic_policy(n)
+    unique_count = len({tuple(doc.topic_tokens) for doc in valid})
+    topic_range = (1, max(1, min(topic_range[1], unique_count, n // max(1, min_topic_size))))
+    if excluded:
+        warnings.append(f"주제 단어가 없는 {len(excluded)}개 응답은 토픽 적합에서 제외하고 감정분석에만 포함했습니다.")
+    if not tokenizer_source().startswith("kiwi"):
+        warnings.append("Kiwi 형태소 분석기를 사용하지 못해 대체 토큰화로 분석했습니다. 한국어 결과를 재검토하세요.")
+    duplicate_count = len(topic_documents) - n
+    if duplicate_count:
+        warnings.append(f"동일 문장 반복 {duplicate_count}건은 모델 적합에서 중복을 제거했습니다. 토픽 건수와 감정 분포에는 원래 빈도를 반영합니다.")
+    if n > LARGE_DATASET_THRESHOLD:
+        warnings.append(
+            "대용량 데이터는 MiniBatch K-Means·MiniBatch NMF와 대표 토픽 수 후보를 비교합니다. 전체 응답의 빈도는 유지합니다."
+        )
     run_id = new_id("run")
     if n == 0:
         empty = _empty_candidate()
+        empty.assignments = [_excluded_assignment(doc) for doc in excluded]
         recommendation = Recommendation(
             run_id=run_id,
             mode=mode,
@@ -72,7 +115,10 @@ def recommend_topics(
         return apply_plain_language_explanations(recommendation)
     texts = [doc.redacted_text for doc in valid]
     vectorizer, matrix = _vectorize(texts)
-    count_vectorizer, count_matrix = _count_vectorize(texts)
+    if n > LARGE_DATASET_THRESHOLD:
+        count_vectorizer, count_matrix = vectorizer, matrix
+    else:
+        count_vectorizer, count_matrix = _count_vectorize(texts)
     embedding_result = embed_texts_with_provider(
         texts,
         embedding_provider,
@@ -81,6 +127,10 @@ def recommend_topics(
         model=embedding_model,
         azure_api_version=azure_api_version,
     )
+    if local_embeddings and (embedding_result is None or not embedding_result.vectors.size):
+        external_warnings = embedding_result.warnings if embedding_result else []
+        embedding_result = embed_texts_locally(texts)
+        warnings.extend(external_warnings)
     candidates = _build_candidates(
         valid,
         vectorizer,
@@ -105,8 +155,44 @@ def recommend_topics(
                 embedding_result.model,
             )
         )
+    if enable_bertopic:
+        bertopic_warnings: list[str] = []
+        bertopic_metric_matrix = (
+            embedding_result.vectors
+            if embedding_result is not None and embedding_result.vectors.size
+            else _lsa_embedding_matrix(matrix, seed)
+        )
+        bertopic_candidate = _build_bertopic_candidate(
+            valid,
+            vectorizer,
+            matrix,
+            bertopic_metric_matrix,
+            topic_range,
+            min_topic_size,
+            seed,
+            (
+                embedding_result.source
+                if embedding_result is not None and embedding_result.vectors.size
+                else "local_tfidf_lsa"
+            ),
+            (
+                embedding_result.model
+                if embedding_result is not None and embedding_result.vectors.size
+                else "TruncatedSVD"
+            ),
+            diagnostic_warnings=bertopic_warnings,
+        )
+        if bertopic_candidate is not None:
+            candidates.append(bertopic_candidate)
+        warnings.extend(bertopic_warnings)
     if not candidates:
         candidates = [_single_topic_candidate(valid, vectorizer, matrix, min_topic_size)]
+    # Compare separation in one shared space. Scores from unrelated TF-IDF,
+    # LSA and transformer spaces must not compete as though they were equal.
+    evaluation_matrix = (embedding_result.vectors
+                         if embedding_result is not None and embedding_result.vectors.size else matrix)
+    _evaluate_candidates_in_common_space(candidates, valid, evaluation_matrix,
+                                         "semantic_embedding" if evaluation_matrix is not matrix else "tfidf")
     _attach_weight_sensitivity(candidates, seed)
     candidates.sort(
         key=lambda candidate: (
@@ -119,6 +205,11 @@ def recommend_topics(
     for rank, candidate in enumerate(candidates, start=1):
         candidate.rank = rank
     recommended = _select_recommended(candidates)
+    bertopic_preference_warning: str | None = None
+    if enable_bertopic:
+        recommended, bertopic_preference_warning = _prefer_bertopic_candidate(
+            candidates, recommended
+        )
     resampling_warning = _attach_resampling_diagnostic(
         recommended,
         valid,
@@ -131,6 +222,8 @@ def recommend_topics(
     wider = _select_alternative(candidates, recommended.topic_count, direction=-1)
     detailed = _select_alternative(candidates, recommended.topic_count, direction=1)
     selection_warnings = []
+    if bertopic_preference_warning:
+        selection_warnings.append(bertopic_preference_warning)
     if not any(bool(candidate.params.get("quality_gate_passed")) for candidate in candidates):
         selection_warnings.append(
             "모든 후보가 최소 토픽 크기 또는 분석 포함률 구조 관문을 충족하지 못해 차선 후보를 제시합니다."
@@ -139,14 +232,27 @@ def recommend_topics(
         selection_warnings.append(resampling_warning)
     if bootstrap_warning:
         selection_warnings.append(bootstrap_warning)
+    for candidate in candidates:
+        _restore_document_frequencies(candidate, valid, topic_documents)
+        candidate.assignments.extend(_excluded_assignment(doc) for doc in excluded)
     if recommended.metrics.get("weight_acceptability", 1.0) < 0.50:
         selection_warnings.append(
             "가중치 시나리오에 따라 다른 후보가 자주 선택되어 권장안의 가중치 민감도가 높습니다."
         )
+    quality_review_reasons = _result_quality_review_reasons(recommended)
+    recommended.params["result_quality_status"] = (
+        "review_required" if quality_review_reasons else "usable_with_human_review"
+    )
+    recommended.params["result_quality_reasons"] = quality_review_reasons
+    if quality_review_reasons:
+        selection_warnings.append(
+            "자동 품질 기준을 충족하지 못해 이 결과는 권장안이 아니라 검토 필요 후보입니다: "
+            + "; ".join(quality_review_reasons)
+        )
     recommendation = Recommendation(
         run_id=run_id,
         mode=mode,
-        valid_response_count=n,
+        valid_response_count=len(topic_documents),
         allowed_topic_range=topic_range,
         minimum_topic_size=min_topic_size,
         recommended=recommended,
@@ -154,6 +260,10 @@ def recommend_topics(
         detailed=detailed,
         candidates=candidates,
         warnings=warnings + selection_warnings + (embedding_result.warnings if embedding_result else []),
+        analysis_diagnostics={"model_fit_document_count": n,
+                              "topic_analyzed_count": len(topic_documents),
+                              "model_evaluation_unit": "unique_response_text",
+                              "embedding": embedding_result.diagnostics if embedding_result else {}},
     )
     return apply_plain_language_explanations(recommendation)
 
@@ -162,14 +272,14 @@ def topic_policy(n: int) -> tuple[str, tuple[int, int], int, list[str]]:
     if n < 15:
         return "초소표본 모드", (1, 3), 2, ["통계적 토픽모델링보다 테마 코딩에 가까운 표본입니다."]
     if n < 30:
-        return "소표본 모드", (2, 4), 2, ["유효 응답 수가 작아 결과는 탐색적 해석으로 사용해야 합니다."]
+        return "소표본 모드", (1, 4), 2, ["유효 응답 수가 작아 결과는 탐색적 해석으로 사용해야 합니다."]
     if n < 50:
-        return "소형 설문 모드", (3, 6), max(3, math.ceil(0.08 * n)), ["불안정 토픽 가능성을 확인해야 합니다."]
+        return "소형 설문 모드", (1, 6), max(3, math.ceil(0.08 * n)), ["불안정 토픽 가능성을 확인해야 합니다."]
     if n < 200:
-        return "표준 모드", (4, 10), max(4, math.ceil(0.04 * n)), []
+        return "표준 모드", (1, 10), max(4, math.ceil(0.04 * n)), []
     if n < 1000:
-        return "대형 설문 모드", (6, 20), max(5, math.ceil(0.02 * n)), []
-    return "대량 분석 모드", (10, 30), max(10, math.ceil(0.01 * n)), ["보고서용 토픽 수가 과도하게 늘지 않도록 검토해야 합니다."]
+        return "대형 설문 모드", (1, 20), max(5, math.ceil(0.02 * n)), []
+    return "대량 분석 모드", (1, 30), max(10, math.ceil(0.01 * n)), ["보고서용 토픽 수가 과도하게 늘지 않도록 검토해야 합니다."]
 
 
 def _vectorize(texts: list[str]) -> tuple[TfidfVectorizer, Any]:
@@ -178,13 +288,11 @@ def _vectorize(texts: list[str]) -> tuple[TfidfVectorizer, Any]:
         token_pattern=None,
         ngram_range=(1, 2),
         min_df=1,
-        max_df=0.95,
+        max_df=1.0,
+        sublinear_tf=True,
+        max_features=12000,
     )
-    try:
-        matrix = vectorizer.fit_transform(texts)
-    except ValueError:
-        vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(2, 4), min_df=1)
-        matrix = vectorizer.fit_transform(texts)
+    matrix = vectorizer.fit_transform(texts)
     return vectorizer, matrix
 
 
@@ -196,14 +304,28 @@ def _count_vectorize(texts: list[str]) -> tuple[CountVectorizer, Any]:
         token_pattern=None,
         ngram_range=(1, 2),
         min_df=1,
-        max_df=0.95,
+        max_df=1.0,
+        max_features=12000,
     )
-    try:
-        matrix = vectorizer.fit_transform(texts)
-    except ValueError:
-        vectorizer = CountVectorizer(analyzer="char", ngram_range=(2, 4), min_df=1)
-        matrix = vectorizer.fit_transform(texts)
+    matrix = vectorizer.fit_transform(texts)
     return vectorizer, matrix
+
+
+def _topic_counts_for_analysis(n: int, topic_range: tuple[int, int]) -> list[int]:
+    lower, upper = topic_range
+    upper = min(upper, n)
+    if upper < lower:
+        return []
+    counts = list(range(lower, upper + 1))
+    if n <= LARGE_DATASET_THRESHOLD or len(counts) <= LARGE_DATASET_CANDIDATE_COUNT:
+        return counts
+    # Preserve simple 1/2/3-topic explanations even in very large surveys.
+    # A coarse grid alone could miss three clear subjects and force a split.
+    simple = [count for count in counts if count <= 3]
+    remaining_lower = max(lower, 4)
+    positions = np.geomspace(remaining_lower, upper,
+                             num=LARGE_DATASET_CANDIDATE_COUNT - len(simple))
+    return sorted(set(simple) | {int(round(position)) for position in positions})
 
 
 def _build_candidates(
@@ -219,6 +341,7 @@ def _build_candidates(
     candidates: list[CandidateSolution] = []
     n = len(documents)
     lower, upper = topic_range
+    large_dataset = n > LARGE_DATASET_THRESHOLD
     for labels in _cluster_dbscan_candidates(matrix, min_topic_size):
         natural_k = _topic_count_from_labels(labels)
         if lower <= natural_k <= min(upper, n):
@@ -234,7 +357,7 @@ def _build_candidates(
                     extra_params={"feature_space": "tfidf_lsa", "topic_terms": "class_tfidf"},
                 )
             )
-    for k in range(lower, min(upper, n) + 1):
+    for k in _topic_counts_for_analysis(n, topic_range):
         labels = _cluster(matrix, k, seed)
         if labels is not None:
             candidates.append(
@@ -246,7 +369,11 @@ def _build_candidates(
                     k,
                     min_topic_size,
                     "kmeans",
-                    extra_params={"feature_space": "tfidf", "topic_terms": "class_tfidf"},
+                    extra_params={
+                        "feature_space": "tfidf",
+                        "topic_terms": "class_tfidf",
+                        "large_dataset_optimized": large_dataset,
+                    },
                 )
             )
         if n <= 250 and k > 1:
@@ -264,6 +391,16 @@ def _build_candidates(
                         extra_params={"feature_space": "tfidf", "topic_terms": "class_tfidf"},
                     )
                 )
+        if large_dataset:
+            solution = _fit_nmf(matrix, k, seed)
+            if solution is not None:
+                nmf_labels, nmf_weights, nmf_components = solution
+                candidates.append(_candidate_from_labels(
+                    documents, vectorizer, matrix, nmf_labels, k, min_topic_size, "nmf_minibatch",
+                    document_topic_weights=nmf_weights, topic_components=nmf_components,
+                    extra_params={"feature_space": "tfidf", "topic_terms": "nmf_components_distinct_ngrams",
+                                  "large_dataset_optimized": True, "nmf_objective": "frobenius"}))
+            continue
         nmf_solution = _fit_nmf(matrix, k, seed)
         if nmf_solution is not None:
             nmf_labels, nmf_weights, nmf_components = nmf_solution
@@ -366,7 +503,7 @@ def _build_embedding_candidates(
                     },
                 )
             )
-    for k in range(lower, min(upper, n) + 1):
+    for k in _topic_counts_for_analysis(n, topic_range):
         labels = _cluster_embeddings_kmeans(embedding_matrix, k, seed)
         if labels is not None:
             candidates.append(
@@ -412,11 +549,132 @@ def _build_embedding_candidates(
 
 def _embedding_engine_prefix(embedding_source: str) -> str:
     return {
+        "local_sentence_transformer": "local_embedding",
         "openai_embeddings": "openai_embedding",
         "gemini_embeddings": "gemini_embedding",
         "azure_openai_embeddings": "azure_openai_embedding",
         "openai_compatible_embeddings": "openai_compatible_embedding",
     }.get(embedding_source, "semantic_embedding")
+
+
+def _build_bertopic_candidate(
+    documents: list[TextDocument],
+    vectorizer: TfidfVectorizer,
+    keyword_matrix: Any,
+    embedding_matrix: np.ndarray,
+    topic_range: tuple[int, int],
+    min_topic_size: int,
+    seed: int,
+    embedding_source: str,
+    embedding_model: str,
+    diagnostic_warnings: list[str] | None = None,
+) -> CandidateSolution | None:
+    if len(documents) < max(15, min_topic_size * 2) or len(documents) > LARGE_DATASET_THRESHOLD:
+        return None
+    try:
+        from bertopic import BERTopic
+        from hdbscan import HDBSCAN
+        from umap import UMAP
+    except ImportError as exc:
+        if diagnostic_warnings is not None:
+            diagnostic_warnings.append(f"BERTopic을 불러오지 못해 후보에서 제외했습니다: {exc}")
+        return None
+
+    n_neighbors = min(15, len(documents) - 1)
+    n_components = min(5, len(documents) - 2, embedding_matrix.shape[1])
+    if n_neighbors < 2 or n_components < 2:
+        return None
+    try:
+        topic_model = BERTopic(
+            language="multilingual",
+            nr_topics=topic_range[1],
+            embedding_model=None,
+            umap_model=UMAP(
+                n_neighbors=n_neighbors,
+                n_components=n_components,
+                min_dist=0.0,
+                metric="cosine",
+                random_state=seed,
+            ),
+            hdbscan_model=HDBSCAN(
+                min_cluster_size=max(2, min_topic_size),
+                # 짧은 대화 맥락은 밀도가 낮아 기본값이 과도하게 많은
+                # 문서를 이상치로 버린다. 최소 크기 관문은 별도로 적용한다.
+                min_samples=1,
+                metric="euclidean",
+                cluster_selection_method="eom",
+                prediction_data=False,
+            ),
+            vectorizer_model=CountVectorizer(
+                tokenizer=tokenize_keywords,
+                token_pattern=None,
+                ngram_range=(1, 2),
+                min_df=1,
+            ),
+            calculate_probabilities=False,
+            low_memory=True,
+            verbose=False,
+        )
+        labels, _ = topic_model.fit_transform(
+            [document.redacted_text for document in documents],
+            embeddings=embedding_matrix,
+        )
+    except Exception as exc:
+        if diagnostic_warnings is not None:
+            diagnostic_warnings.append(
+                f"BERTopic 후보 생성에 실패해 다른 모델만 비교했습니다: {type(exc).__name__}: {exc}"
+            )
+        return None
+
+    label_array = np.asarray(labels, dtype=int)
+    topic_count = _topic_count_from_labels(label_array)
+    lower, upper = topic_range
+    if topic_count < lower or topic_count > min(upper, len(documents)):
+        if diagnostic_warnings is not None:
+            diagnostic_warnings.append(
+                f"BERTopic 자연 군집 수 {topic_count}개가 허용 범위 {lower}-{upper}개를 벗어나 후보에서 제외했습니다."
+            )
+        return None
+    return _candidate_from_labels(
+        documents,
+        vectorizer,
+        keyword_matrix,
+        label_array,
+        topic_count,
+        min_topic_size,
+        "bertopic",
+        metric_matrix=embedding_matrix,
+        extra_params={
+            "embedding_source": embedding_source,
+            "embedding_model": embedding_model,
+            "feature_space": "bertopic_umap_hdbscan",
+            "topic_terms": "class_tfidf",
+        },
+    )
+
+
+def _lsa_embedding_matrix(matrix: Any, seed: int) -> np.ndarray:
+    n_docs, n_features = matrix.shape
+    n_components = min(32, n_docs - 1, n_features - 1)
+    if n_components < 2:
+        dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+        return Normalizer(copy=False).fit_transform(dense)
+    reduced = TruncatedSVD(n_components=n_components, random_state=seed).fit_transform(matrix)
+    return Normalizer(copy=False).fit_transform(reduced)
+
+
+def _result_quality_review_reasons(candidate: CandidateSolution) -> list[str]:
+    reasons: list[str] = []
+    semantic_quality = candidate.metrics.get("semantic_quality")
+    if semantic_quality is not None and semantic_quality < 0.05:
+        reasons.append(f"군집 분리도 {semantic_quality:.2f}가 0.05 미만")
+    resampling = candidate.metrics.get("resampling_stability")
+    if resampling is not None and resampling < 0.60:
+        reasons.append(f"부분표본 일치도 {resampling:.2f}가 0.60 미만")
+    bootstrap = candidate.metrics.get("bootstrap_gate_pass_rate")
+    if bootstrap is not None and bootstrap < 0.80:
+        reasons.append(f"Bootstrap 구조 관문 통과율 {bootstrap:.0%}가 80% 미만")
+    return reasons
 
 
 def _cluster(matrix: Any, k: int, seed: int) -> np.ndarray | None:
@@ -425,7 +683,16 @@ def _cluster(matrix: Any, k: int, seed: int) -> np.ndarray | None:
         return np.zeros(n, dtype=int)
     if n < k:
         return None
-    model = KMeans(n_clusters=k, random_state=seed, n_init=10)
+    if n > LARGE_DATASET_THRESHOLD:
+        model = MiniBatchKMeans(
+            n_clusters=k,
+            random_state=seed,
+            n_init=3,
+            batch_size=min(2048, n),
+            max_iter=100,
+        )
+    else:
+        model = KMeans(n_clusters=k, random_state=seed, n_init=10)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConvergenceWarning)
         labels = model.fit_predict(matrix)
@@ -434,13 +701,37 @@ def _cluster(matrix: Any, k: int, seed: int) -> np.ndarray | None:
     return labels if len(set(int(label) for label in labels)) == k else None
 
 
+def _evaluate_candidates_in_common_space(candidates: list[CandidateSolution], documents: list[TextDocument],
+                                         matrix: Any, space: str) -> None:
+    for candidate in candidates:
+        labels = _labels_from_assignments(candidate, documents)
+        separation = _silhouette(matrix, labels)
+        candidate.metrics["semantic_quality"] = separation
+        small_ratio = sum(t.count < candidate.params.get("min_topic_size", 1) for t in candidate.topics) / max(1, len(candidate.topics))
+        candidate.metrics["stability"] = round(max(0.0, min(1.0,
+            separation * 0.4 + candidate.metrics["coherence"] * 0.3
+            + candidate.metrics["balance"] * 0.2 + 0.1 - small_ratio * 0.2)), 3)
+        candidate.score = round(_composite_score(candidate.metrics, candidate.metrics["penalty"], SCORE_WEIGHTS), 3)
+        candidate.params["evaluation_space"] = space
+        candidate.params["metric_profile"] = "heuristic_v5_common_space"
+
+
 def _cluster_embeddings_kmeans(matrix: np.ndarray, k: int, seed: int) -> np.ndarray | None:
     n = matrix.shape[0]
     if k <= 1:
         return np.zeros(n, dtype=int)
     if n < k:
         return None
-    model = KMeans(n_clusters=k, random_state=seed, n_init=20)
+    if n > LARGE_DATASET_THRESHOLD:
+        model = MiniBatchKMeans(
+            n_clusters=k,
+            random_state=seed,
+            n_init=3,
+            batch_size=min(2048, n),
+            max_iter=100,
+        )
+    else:
+        model = KMeans(n_clusters=k, random_state=seed, n_init=20)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConvergenceWarning)
         labels = model.fit_predict(matrix)
@@ -466,12 +757,15 @@ def _cluster_agglomerative(matrix: Any, k: int) -> np.ndarray | None:
 
 def _cluster_dbscan_candidates(matrix: Any, min_topic_size: int) -> list[np.ndarray]:
     n_docs, n_features = matrix.shape
-    if n_docs < max(4, min_topic_size * 2) or n_features < 2:
+    if (
+        n_docs > LARGE_DATASET_THRESHOLD
+        or n_docs < max(4, min_topic_size * 2)
+        or n_features < 2
+    ):
         return []
-    dense = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
     n_components = min(10, n_docs - 1, n_features - 1)
     if n_components < 2:
-        reduced = dense
+        reduced = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
     else:
         reduced = TruncatedSVD(n_components=n_components, random_state=42).fit_transform(matrix)
     normalized = Normalizer(copy=False).fit_transform(reduced)
@@ -492,7 +786,7 @@ def _cluster_dbscan_candidates(matrix: Any, min_topic_size: int) -> list[np.ndar
 
 def _cluster_embedding_dbscan_candidates(matrix: np.ndarray, min_topic_size: int) -> list[np.ndarray]:
     n_docs = matrix.shape[0]
-    if n_docs < max(4, min_topic_size * 2):
+    if n_docs > LARGE_DATASET_THRESHOLD or n_docs < max(4, min_topic_size * 2):
         return []
     candidates: list[np.ndarray] = []
     seen: set[tuple[int, ...]] = set()
@@ -524,7 +818,11 @@ def _fit_nmf(
         return None
     init = "nndsvda" if min(n_docs, n_features) > k else "random"
     if objective == "frobenius":
-        model = NMF(n_components=k, init=init, random_state=seed, max_iter=600)
+        if n_docs > LARGE_DATASET_THRESHOLD:
+            model = MiniBatchNMF(n_components=k, init=init, random_state=seed, max_iter=100,
+                                batch_size=min(1024, n_docs))
+        else:
+            model = NMF(n_components=k, init=init, random_state=seed, max_iter=600)
     elif objective == "kullback-leibler":
         model = NMF(
             n_components=k,
@@ -610,6 +908,10 @@ def _candidate_from_labels(
         )
     else:
         topics, assignments = _topics_from_labels(documents, vectorizer, matrix, labels)
+        _attach_cluster_memberships(assignments, labels, metric_matrix if metric_matrix is not None else matrix)
+    for assignment in assignments:
+        if assignment.score_method == "normalized_topic_weight":
+            assignment.score_method = "lda_posterior" if source == "lda" else "normalized_nmf_weight"
     actual_topic_count = _topic_count_from_labels(labels)
     metrics = _metrics(
         vectorizer,
@@ -646,6 +948,7 @@ def _candidate_from_labels(
             "min_topic_size": min_topic_size,
             "tokenizer": tokenizer_source(),
             "metric_profile": "heuristic_v4_topic_representation",
+            "assignment_score_note": "모델 소속도이며 분류 정확도나 보정된 신뢰확률이 아닙니다.",
             "requested_topic_count": k,
             "quality_gate_passed": not quality_gate_reasons,
             "quality_gate_reasons": quality_gate_reasons,
@@ -672,7 +975,7 @@ def _topics_from_labels(
         if int(label) == -1:
             continue
         label_to_indices[int(label)].append(idx)
-    class_term_scores = _class_tfidf_scores(documents, labels, vectorizer)
+    class_term_scores = _class_tfidf_scores(documents, labels, vectorizer, matrix=matrix)
     topics: list[Topic] = []
     topic_ids: dict[int, str] = {}
     for order, (label, indices) in enumerate(sorted(label_to_indices.items()), start=1):
@@ -683,7 +986,7 @@ def _topics_from_labels(
         keywords = _select_distinct_keywords(feature_names, class_term_scores.get(label, mean_vector))
         reps = _representative_responses([documents[i] for i in indices], sub_matrix, mean_vector)
         topic_label = label_topic(keywords, reps)
-        sentiment = aggregate_topic_sentiment([documents[i].redacted_text for i in indices])
+        sentiment = aggregate_document_sentiment([documents[i] for i in indices])
         topics.append(
             Topic(
                 topic_id=topic_id,
@@ -698,6 +1001,8 @@ def _topics_from_labels(
                 urgency_score=sentiment.average_urgency_score,
                 sentiment_evidence=list(sentiment.evidence_terms),
                 sentiment_method=sentiment.source,
+                sentiment_distribution=sentiment.label_counts,
+                sentiment_evidence_coverage=sentiment.evidence_coverage,
             )
         )
     assignments = [
@@ -711,6 +1016,59 @@ def _topics_from_labels(
         for idx, doc in enumerate(documents)
     ]
     return topics, assignments
+
+
+def _excluded_assignment(document: TextDocument) -> TopicAssignment:
+    return TopicAssignment(document.id, "OUTLIER", 0.0, True, "no_topic_terms",
+                           score_method="not_assigned", needs_review=True)
+
+
+def _restore_document_frequencies(candidate: CandidateSolution, fitted: list[TextDocument],
+                                  documents: list[TextDocument]) -> None:
+    by_id = {assignment.document_id: assignment for assignment in candidate.assignments}
+    by_text = {doc.redacted_text: by_id[doc.id] for doc in fitted}
+    candidate.assignments = [replace(by_text[doc.redacted_text], document_id=doc.id,
+                                    membership_scores=dict(by_text[doc.redacted_text].membership_scores))
+                             for doc in documents]
+    topic_documents: dict[str, list[TextDocument]] = defaultdict(list)
+    for doc, assignment in zip(documents, candidate.assignments):
+        topic_documents[assignment.topic_id].append(doc)
+    for topic in candidate.topics:
+        members = topic_documents[topic.topic_id]
+        aggregate = aggregate_document_sentiment(members)
+        topic.count = len(members)
+        topic.share = round(len(members) / max(1, len(documents)), 4)
+        topic.sentiment_method = aggregate.source
+        topic.sentiment_label = aggregate.dominant_label
+        topic.sentiment_score = aggregate.average_polarity_score
+        topic.urgency_score = aggregate.average_urgency_score
+        topic.sentiment_evidence = list(aggregate.evidence_terms)
+        topic.sentiment_distribution = aggregate.label_counts
+        topic.sentiment_evidence_coverage = aggregate.evidence_coverage
+    candidate.params["model_fit_document_count"] = len(fitted)
+    candidate.params["reported_document_count"] = len(documents)
+    candidate.params["metric_unit"] = "unique_response_text"
+    candidate.params["bootstrap_unit"] = "unique_response_text"
+
+
+def _attach_cluster_memberships(assignments: list[TopicAssignment], labels: np.ndarray, matrix: Any) -> None:
+    """Relative centroid similarity, explicitly not a calibrated probability."""
+    active = sorted({int(label) for label in labels if int(label) >= 0})
+    if not active:
+        return
+    centroids = np.vstack([np.asarray(matrix[labels == label].mean(axis=0)).ravel() for label in active])
+    similarities = np.maximum(0.0, cosine_similarity(matrix, centroids))
+    totals = similarities.sum(axis=1, keepdims=True)
+    memberships = np.divide(similarities, totals, out=np.zeros_like(similarities), where=totals > 0)
+    ids = {label: f"T{order:02d}" for order, label in enumerate(active, 1)}
+    for index, assignment in enumerate(assignments):
+        assignment.score_method = "relative_centroid_similarity"
+        assignment.membership_scores = {ids[label]: round(float(memberships[index, column]), 6)
+                                        for column, label in enumerate(active)}
+        assignment.probability = 0.0 if assignment.is_outlier else assignment.membership_scores.get(assignment.topic_id, 0.0)
+        ordered = sorted(assignment.membership_scores.values(), reverse=True)
+        margin = ordered[0] - ordered[1] if len(ordered) > 1 else ordered[0]
+        assignment.needs_review = assignment.is_outlier or assignment.probability < 0.55 or margin < 0.15
 
 
 def _topics_from_components(
@@ -739,7 +1097,7 @@ def _topics_from_components(
             if len(reps) == 3:
                 break
         topic_label = label_topic(keywords, reps)
-        sentiment = aggregate_topic_sentiment([documents[index].redacted_text for index in indices])
+        sentiment = aggregate_document_sentiment([documents[index] for index in indices])
         topics.append(
             Topic(
                 topic_id=topic_ids[label],
@@ -754,6 +1112,8 @@ def _topics_from_components(
                 urgency_score=sentiment.average_urgency_score,
                 sentiment_evidence=list(sentiment.evidence_terms),
                 sentiment_method=sentiment.source,
+                sentiment_distribution=sentiment.label_counts,
+                sentiment_evidence_coverage=sentiment.evidence_coverage,
             )
         )
     assignments: list[TopicAssignment] = []
@@ -771,6 +1131,10 @@ def _topics_from_components(
                 probability=round(max(0.0, min(1.0, probability)), 4),
                 is_outlier=label == -1,
                 assignment_source="model",
+                membership_scores={topic_ids[label_id]: round(float(row[label_id] / row.sum()), 6)
+                                   for label_id in active_labels if row.sum() > 0} if label != -1 else {},
+                score_method="normalized_topic_weight",
+                needs_review=label == -1 or probability < 0.55,
             )
         )
     return topics, assignments
@@ -780,6 +1144,7 @@ def _class_tfidf_scores(
     documents: list[TextDocument],
     labels: np.ndarray,
     vectorizer: TfidfVectorizer | CountVectorizer,
+    matrix: Any | None = None,
 ) -> dict[int, np.ndarray]:
     """Score terms after treating each model cluster as one class document.
 
@@ -789,21 +1154,27 @@ def _class_tfidf_scores(
     """
 
     vocabulary = vectorizer.vocabulary_
-    analyzer = vectorizer.build_analyzer()
     active_labels = sorted({int(label) for label in labels if int(label) != -1})
     if not active_labels or not vocabulary:
         return {}
     row_by_label = {label: row for row, label in enumerate(active_labels)}
     counts = np.zeros((len(active_labels), len(vocabulary)), dtype=float)
-    for document, raw_label in zip(documents, labels):
-        label = int(raw_label)
-        if label == -1:
-            continue
-        row = row_by_label[label]
-        for term in analyzer(document.redacted_text):
-            column = vocabulary.get(term)
-            if column is not None:
-                counts[row, column] += 1.0
+    if (matrix is not None and not isinstance(vectorizer, TfidfVectorizer)
+            and matrix.shape == (len(documents), len(vocabulary))):
+        for label, row in row_by_label.items():
+            indices = np.flatnonzero(labels == label)
+            counts[row] = np.asarray(matrix[indices].sum(axis=0), dtype=float).ravel()
+    else:
+        analyzer = vectorizer.build_analyzer()
+        for document, raw_label in zip(documents, labels):
+            label = int(raw_label)
+            if label == -1:
+                continue
+            row = row_by_label[label]
+            for term in analyzer(document.redacted_text):
+                column = vocabulary.get(term)
+                if column is not None:
+                    counts[row, column] += 1.0
     class_lengths = counts.sum(axis=1)
     total_terms = float(class_lengths.sum())
     if total_terms <= 0:
@@ -871,11 +1242,23 @@ def _is_redundant_keyword(candidate: str, selected: list[str]) -> bool:
 def _representative_responses(
     documents: list[TextDocument], sub_matrix: Any, mean_vector: np.ndarray
 ) -> list[str]:
-    dense = sub_matrix.toarray() if hasattr(sub_matrix, "toarray") else np.asarray(sub_matrix)
-    if dense.size == 0:
+    if sub_matrix.shape[0] == 0 or sub_matrix.shape[1] == 0:
         return []
-    norms = np.linalg.norm(dense, axis=1) * max(np.linalg.norm(mean_vector), 1e-9)
-    similarities = np.divide(dense @ mean_vector, norms, out=np.zeros(dense.shape[0]), where=norms != 0)
+    mean_norm = max(np.linalg.norm(mean_vector), 1e-9)
+    if hasattr(sub_matrix, "multiply"):
+        row_norms = np.sqrt(np.asarray(sub_matrix.multiply(sub_matrix).sum(axis=1)).ravel())
+        dot_products = np.asarray(sub_matrix @ mean_vector).ravel()
+    else:
+        dense = np.asarray(sub_matrix)
+        row_norms = np.linalg.norm(dense, axis=1)
+        dot_products = np.asarray(dense @ mean_vector).ravel()
+    norms = row_norms * mean_norm
+    similarities = np.divide(
+        dot_products,
+        norms,
+        out=np.zeros(sub_matrix.shape[0], dtype=float),
+        where=norms != 0,
+    )
     order = similarities.argsort()[::-1]
     reps: list[str] = []
     for idx in order[:3]:
@@ -898,10 +1281,13 @@ def _metrics(
     coverage = sum(int(label) != -1 for label in labels) / max(1, len(labels))
     diversity = _topic_diversity(topics)
     coherence = _coherence(vectorizer, coherence_matrix if coherence_matrix is not None else matrix, topics)
-    labelability = sum(
+    representation_completeness = sum(
         min(1.0, (min(len(topic.keywords), 5) / 5.0) * 0.6 + (min(len(topic.representative_responses), 3) / 3.0) * 0.4)
         for topic in topics
     ) / max(1, len(topics))
+    keyword_support = _keyword_document_support(vectorizer, coherence_matrix if coherence_matrix is not None else matrix,
+                                               labels, topics)
+    labelability = 0.5 * representation_completeness + 0.5 * keyword_support
     balance = _balance(counts)
     small_topic_ratio = sum(count < min_topic_size for count in counts) / max(1, len(counts))
     # Backward-compatible field name. This is a composite heuristic, not
@@ -918,7 +1304,24 @@ def _metrics(
         "diversity": round(diversity, 3),
         "labelability": round(labelability, 3),
         "balance": round(balance, 3),
+        "keyword_document_support": round(keyword_support, 3),
     }
+
+
+def _keyword_document_support(vectorizer: Any, matrix: Any, labels: np.ndarray, topics: list[Topic]) -> float:
+    """Fraction of members actually explained by a topic's top keyword set."""
+    vocabulary = getattr(vectorizer, "vocabulary_", {})
+    active = sorted({int(label) for label in labels if int(label) >= 0})
+    support: list[float] = []
+    for label, topic in zip(active, topics):
+        columns = [vocabulary[word] for word in topic.keywords[:5] if word in vocabulary]
+        if not columns:
+            support.append(0.0)
+            continue
+        sub = matrix[np.flatnonzero(labels == label)][:, columns]
+        hits = np.asarray((sub > 0).sum(axis=1)).ravel()
+        support.append(float(np.mean(hits >= min(2, len(columns)))))
+    return float(np.mean(support)) if support else 0.0
 
 
 def _silhouette(matrix: Any, labels: np.ndarray) -> float:
@@ -930,7 +1333,14 @@ def _silhouette(matrix: Any, labels: np.ndarray) -> float:
         return 0.0
     filtered_matrix = matrix[included]
     try:
-        raw = silhouette_score(filtered_matrix, filtered_labels, metric="cosine")
+        sample_size = min(SILHOUETTE_SAMPLE_SIZE, filtered_labels.shape[0])
+        raw = silhouette_score(
+            filtered_matrix,
+            filtered_labels,
+            metric="cosine",
+            sample_size=sample_size if sample_size < filtered_labels.shape[0] else None,
+            random_state=42,
+        )
     except Exception:
         return 0.0
     return round(max(0.0, min(1.0, raw)), 3)
@@ -1101,7 +1511,7 @@ def _attach_weight_sensitivity(
     for scenario_index in range(scenarios):
         scores = scenario_scores[:, scenario_index]
         best_score = float(scores.max())
-        threshold = max(0.03, best_score * 0.05)
+        threshold = max(0.005, best_score * 0.01)
         near_best = [
             index
             for index, score in enumerate(scores)
@@ -1116,7 +1526,8 @@ def _attach_weight_sensitivity(
     pool_indices = {id(candidate): index for index, candidate in enumerate(pool)}
     for candidate in candidates:
         candidate.params["base_score_weights"] = dict(SCORE_WEIGHTS)
-        candidate.params["weight_sensitivity_profile"] = "bounded_monte_carlo_v1"
+        candidate.params["weight_sensitivity_profile"] = "bounded_monte_carlo_v2"
+        candidate.params["near_tie_threshold"] = "max(0.005, score * 0.01)"
         candidate.params["weight_sensitivity_scenarios"] = scenarios
         candidate.params["weight_multiplier_range"] = [float(low), float(high)]
         pool_index = pool_indices.get(id(candidate))
@@ -1142,8 +1553,8 @@ def _select_recommended(candidates: list[CandidateSolution]) -> CandidateSolutio
     passed = [candidate for candidate in candidates if candidate.params.get("quality_gate_passed") is True]
     pool = passed or candidates
     best_score = max(candidate.score for candidate in pool)
-    threshold = max(0.03, best_score * 0.05)
-    near_best = [candidate for candidate in pool if best_score - candidate.score <= threshold]
+    threshold = max(0.01, best_score * 0.01)
+    near_best = [candidate for candidate in pool if best_score - candidate.score <= threshold + 1e-12]
     near_best.sort(
         key=lambda candidate: (
             -candidate.metrics.get("weight_acceptability", 0.0),
@@ -1152,6 +1563,35 @@ def _select_recommended(candidates: list[CandidateSolution]) -> CandidateSolutio
         )
     )
     return near_best[0]
+
+
+def _prefer_bertopic_candidate(
+    candidates: list[CandidateSolution], current: CandidateSolution
+) -> tuple[CandidateSolution, str | None]:
+    """Prefer valid BERTopic chat clusters when their separation is materially clearer."""
+
+    eligible = [
+        candidate
+        for candidate in candidates
+        if candidate.params.get("engine") == "bertopic"
+        and candidate.params.get("quality_gate_passed") is True
+        and candidate.metrics.get("coverage", 0.0) >= 0.70
+    ]
+    if not eligible:
+        return current, None
+    bertopic = max(
+        eligible,
+        key=lambda candidate: (candidate.metrics.get("semantic_quality", 0.0), candidate.score),
+    )
+    current_separation = current.metrics.get("semantic_quality", 0.0)
+    bertopic_separation = bertopic.metrics.get("semantic_quality", 0.0)
+    if bertopic_separation < 0.05 or bertopic_separation - current_separation < 0.05:
+        return current, None
+    return (
+        bertopic,
+        "카카오 대화 특화 규칙에 따라 구조 관문을 통과하고 군집 분리도가 "
+        f"{current_separation:.2f}에서 {bertopic_separation:.2f}로 개선된 BERTopic 후보를 우선했습니다.",
+    )
 
 
 def _select_alternative(
@@ -1191,9 +1631,9 @@ def _attach_resampling_diagnostic(
     if candidate.topic_count <= 1:
         candidate.params["resampling_status"] = "not_informative_single_topic"
         return None
-    if "dbscan" in engine:
+    if "dbscan" in engine or engine == "bertopic":
         candidate.params["resampling_status"] = "unsupported_for_density_candidate"
-        return "선정 후보가 DBSCAN이어서 부분표본 일치도를 계산하지 않았습니다."
+        return "선정 후보가 밀도 기반 군집이어서 부분표본 일치도를 계산하지 않았습니다."
 
     reference = _labels_from_assignments(candidate, documents)
     scores: list[float] = []
@@ -1355,7 +1795,7 @@ def _refit_candidate_labels(
         return _cluster(tfidf_matrix, topic_count, seed)
     if engine == "agglomerative":
         return _cluster_agglomerative(tfidf_matrix, topic_count)
-    if engine == "nmf":
+    if engine in {"nmf", "nmf_minibatch"}:
         solution = _fit_nmf(tfidf_matrix, topic_count, seed)
         return solution[0] if solution is not None else None
     if engine == "nmf_kl":

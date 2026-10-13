@@ -71,6 +71,14 @@ class StorageRepositoryTests(unittest.TestCase):
             self.assertEqual(restored.selected_topics[0].topic_id, "T01")
             self.assertEqual(restored.assignments[0].document_id, "doc_1")
             self.assertEqual([item.run_id for item in reopened.list_runs("dataset_test")], ["run_test"])
+            overview = reopened.list_run_overviews(limit=1)[0]
+            self.assertEqual(overview.run_id, "run_test")
+            self.assertEqual(overview.project_name, package.project["name"])
+            self.assertEqual(overview.valid_response_count, 1)
+            self.assertEqual(overview.recommended_topic_count, 1)
+            recommendation_json = reopened.get_run_recommendation_json("run_test")
+            self.assertIsNotNone(recommendation_json)
+            self.assertEqual(recommendation_json["run_id"], "run_test")
 
     def test_delete_run_removes_only_requested_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

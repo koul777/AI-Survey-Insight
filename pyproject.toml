@@ -1,9 +1,10 @@
 [project]
 name = "ai-survey-insight"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-assisted Korean survey free-response analysis and report generation"
 requires-python = ">=3.11"
 dependencies = [
+  "bertopic>=0.17.4,<0.18",
   "fastapi>=0.115,<1",
   "kiwipiepy>=0.20,<1",
   "openpyxl>=3.1,<4",
@@ -24,3 +25,6 @@ survey-insight = "survey_insight.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["survey_insight*"]
+
+[tool.setuptools.package-data]
+survey_insight = ["data/*.tsv", "data/*.md"]

@@ -17,6 +17,64 @@ from survey_insight.storage import StorageRepository
 
 
 class ApiTests(unittest.TestCase):
+    def test_document_sentiment_endpoint_is_redacted_filtered_and_persisted(self) -> None:
+        from survey_insight.models import TableData
+        from survey_insight.pipeline import analyze_table
+
+        package = analyze_table(TableData(["response"], [
+            {"response": "교육에 만족합니다. 연락은 secret@example.com"},
+            {"response": "급여 지급이 늦고 불공정합니다."},
+            {"response": "없음"},
+        ]), text_column="response", group_columns=[])
+        run_id = package.recommendation.run_id
+        with tempfile.TemporaryDirectory() as tmp, patch.object(api_module, "_STORE", StorageRepository(Path(tmp) / "app.db")), patch.object(api_module, "_RUNS", {}):
+            api_module._STORE.save_run(package=package)
+            client = TestClient(app)
+            response = client.get(f"/model-runs/{run_id}/documents?limit=1")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["total"], 3)
+            self.assertEqual(len(response.json()["items"]), 1)
+            self.assertNotIn("original_text", response.text)
+            self.assertNotIn("secret@example.com", response.text)
+            self.assertIn("[EMAIL]", response.text)
+            next_page = client.get(f"/model-runs/{run_id}/documents?offset=1&limit=1").json()
+            self.assertEqual(next_page["total"], 3)
+            self.assertNotEqual(next_page["items"][0]["document_id"], response.json()["items"][0]["document_id"])
+            self.assertEqual(client.get(f"/model-runs/{run_id}/documents?offset=5").json()["items"], [])
+            filtered = client.get(f"/model-runs/{run_id}/documents?sentiment_label=negative").json()
+            self.assertEqual(filtered["total"], 1)
+            self.assertEqual(filtered["items"][0]["sentiment"]["polarity_label"], "negative")
+            self.assertEqual(client.get(f"/model-runs/{run_id}/documents?limit=101").status_code, 422)
+            self.assertEqual(client.get(f"/model-runs/{run_id}/documents?offset=-1").status_code, 422)
+            self.assertEqual(client.get("/model-runs/run_missing/documents").status_code, 404)
+
+    def test_plain_txt_upload_creates_a_profile_and_persists_the_dataset(self) -> None:
+        body = "교육이 유익했습니다.\n실습 시간을 늘려주세요.\n".encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StorageRepository(Path(tmp) / "app.db")
+            api_module._TABLES.clear()
+            api_module._PROFILES.clear()
+            try:
+                with patch.object(api_module, "_STORE", store):
+                    response = TestClient(app).post(
+                        "/datasets/upload?filename=responses.txt",
+                        content=body,
+                        headers={"content-type": "text/plain; charset=utf-8"},
+                    )
+
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertEqual(payload["profile"]["row_count"], 2)
+                    self.assertEqual(payload["profile"]["column_count"], 1)
+                    self.assertEqual(payload["profile"]["columns"][0]["column_name"], "response")
+                    stored = store.get_dataset(payload["dataset_id"])
+                    self.assertIsNotNone(stored)
+                    self.assertEqual(stored.filename, "responses.txt")
+                    self.assertEqual(stored.data, body)
+            finally:
+                api_module._TABLES.clear()
+                api_module._PROFILES.clear()
+
     def test_analysis_error_response_does_not_expose_api_key(self) -> None:
         secret = "sk-live-secret-value-abcdef1234567890"
         with patch("survey_insight.api._get_table", return_value=object()), patch(
@@ -132,6 +190,11 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(run.status_code, 200)
         run_payload = run.json()
         self.assertEqual(run_payload["recommendation"]["valid_response_count"], 16)
+        compact = client.get(
+            f"/model-runs/{run_payload['run_id']}/recommendation?compact=true"
+        ).json()
+        self.assertEqual(compact["recommended"]["assignments"], [])
+        self.assertTrue(compact["recommended"]["topics"])
         self.assertNotIn("visual_url", run_payload["recommendation"])
         stored_run = _STORE.get_run(run_payload["run_id"])
         self.assertIsNotNone(stored_run)
